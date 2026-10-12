@@ -16,7 +16,7 @@ uint32_t directColor(uint8_t r, uint8_t g, uint8_t b)
     return DirectColorFlag | rgb565(r, g, b);
 }
 
-TerminalEmulator::Cell BlankCell(uint32_t fg = 7, uint32_t bg = 0)
+TerminalEmulator::Cell BlankCell(uint32_t fg = 256, uint32_t bg = 257)
 {
     TerminalEmulator::Cell cell;
     cell.ch = " ";
@@ -231,8 +231,8 @@ void TerminalEmulator::markCursorDirty()
 
 void TerminalEmulator::resetAttrs()
 {
-    _fg = 7;
-    _bg = 0;
+    _fg = 256;
+    _bg = 257;
     _bold = false;
     _inverse = false;
 }
@@ -660,9 +660,9 @@ void TerminalEmulator::executeCsi(char command)
                 else if (p == 22) _bold = false;
                 else if (p == 27) _inverse = false;
                 else if (p >= 30 && p <= 37) _fg = static_cast<uint32_t>(p - 30);
-                else if (p == 39) _fg = 7;
+                else if (p == 39) _fg = 256;
                 else if (p >= 40 && p <= 47) _bg = static_cast<uint32_t>(p - 40);
-                else if (p == 49) _bg = 0;
+                else if (p == 49) _bg = 257;
                 else if (p >= 90 && p <= 97) _fg = static_cast<uint32_t>(p - 90 + 8);
                 else if (p >= 100 && p <= 107) _bg = static_cast<uint32_t>(p - 100 + 8);
                 else if ((p == 38 || p == 48) && i + 2 < _params.size() && _params[i + 1] == 5) {

@@ -53,6 +53,7 @@ private:
     size_t _head{0};
     size_t _tail{0};
     uint32_t _events{0};
+    bool _tab5Ready{false};
     String _status{"not initialized"};
     bool _bleEnabled{false};
     String _bleName;

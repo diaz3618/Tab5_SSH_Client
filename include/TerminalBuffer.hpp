@@ -19,6 +19,7 @@ public:
     size_t inputViewportRow() const;
     size_t viewportRows() const { return _rows; }
     bool atBottom() const;
+    uint32_t generation() const { return _generation; }
 
 private:
     void pushLine(String line);
@@ -32,4 +33,5 @@ private:
     uint8_t _escapeState{0};
     std::vector<String> _lines;
     String _current;
+    uint32_t _generation{0};
 };

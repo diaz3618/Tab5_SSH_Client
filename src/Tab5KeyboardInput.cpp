@@ -1029,13 +1029,16 @@ bool Tab5KeyboardInput::begin()
 #if USE_M5_TAB5_KEYBOARD
     auto cfg = keyboard.config();
     cfg.mode = m5::unit::tab5_keyboard::Mode::Character;
-    cfg.software_repeat = true;
-    cfg.irq_pin = -1;
+    cfg.software_repeat = false;
+    cfg.irq_pin = 50;
     cfg.interval_ms = 10;
     keyboard.config(cfg);
 
     Wire.end();
-    Wire.begin(TAB5_KEYBOARD_SDA, TAB5_KEYBOARD_SCL, keyboard.component_config().clock);
+    const bool wireReady = Wire.begin(TAB5_KEYBOARD_SDA, TAB5_KEYBOARD_SCL, keyboard.component_config().clock);
+    Wire.beginTransmission(0x6D);
+    const uint8_t probeResult = Wire.endTransmission();
+    Serial.printf("Tab5 keyboard I2C begin=%u address=0x6D probe=%u\n", wireReady, probeResult);
     if (!units.add(keyboard, Wire) || !units.begin()) {
         _status = "Tab5 keyboard not found; Serial input fallback active";
     } else {
@@ -1060,6 +1063,7 @@ bool Tab5KeyboardInput::begin()
     if (_bleEnabled) {
         _status += "; BLE keyboard pending";
     }
+    _tab5Ready = tab5Ready;
     return tab5Ready;
 }
 
@@ -1071,8 +1075,8 @@ void Tab5KeyboardInput::update()
     }
 #endif
 #if USE_M5_TAB5_KEYBOARD
-    keyboard.update(true);
-    while (!keyboard.empty()) {
+    if (_tab5Ready) units.update();
+    while (_tab5Ready && !keyboard.empty()) {
         auto event = keyboard.oldest();
         ++_events;
         if (event.type == m5::unit::tab5_keyboard::EventType::Character) {

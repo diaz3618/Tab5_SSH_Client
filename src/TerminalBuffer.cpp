@@ -63,6 +63,7 @@ TerminalBuffer::TerminalBuffer(size_t maxLines) : _maxLines(maxLines)
 
 void TerminalBuffer::setViewport(size_t columns, size_t rows)
 {
+    ++_generation;
     _columns = max<size_t>(1, columns);
     _rows = max<size_t>(1, rows);
     trim();
@@ -70,6 +71,7 @@ void TerminalBuffer::setViewport(size_t columns, size_t rows)
 
 void TerminalBuffer::clear()
 {
+    ++_generation;
     _lines.clear();
     _current = "";
     _scrollOffset = 0;
@@ -78,6 +80,7 @@ void TerminalBuffer::clear()
 
 void TerminalBuffer::append(const char* data, size_t len)
 {
+    if (len) ++_generation;
     for (size_t i = 0; i < len; ++i) {
         appendChar(data[i]);
     }
@@ -90,11 +93,13 @@ void TerminalBuffer::append(const String& text)
 
 void TerminalBuffer::inputEcho(char c)
 {
+    ++_generation;
     appendChar(c);
 }
 
 void TerminalBuffer::backspace()
 {
+    ++_generation;
     if (_current.length()) {
         _current.remove(previousUtf8CharStart(_current));
     }
@@ -102,6 +107,7 @@ void TerminalBuffer::backspace()
 
 void TerminalBuffer::scroll(int delta)
 {
+    ++_generation;
     const size_t total = _lines.size() + (_current.length() ? 1 : 0);
     const size_t maxOffset = total > _rows ? total - _rows : 0;
     int next = static_cast<int>(_scrollOffset) + delta;
@@ -116,6 +122,7 @@ void TerminalBuffer::scroll(int delta)
 
 void TerminalBuffer::scrollToBottom()
 {
+    ++_generation;
     _scrollOffset = 0;
 }
 
