@@ -9,11 +9,15 @@ constexpr const char* kConfigPath = "/profiles.json";
 
 bool SettingsStore::begin()
 {
-    if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
-        _lastError = "LittleFS mount failed";
-        return false;
+    if (LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
+        return true;
     }
-    return true;
+    // Started from a launcher with its own partition table: use whatever data partition it provides.
+    if (LittleFS.begin(true, "/littlefs", 10, "spiffs")) {
+        return true;
+    }
+    _lastError = "LittleFS mount failed";
+    return false;
 }
 
 bool SettingsStore::load(AppConfig& config)
@@ -50,6 +54,8 @@ bool SettingsStore::load(AppConfig& config)
         profile.user = item["user"] | "";
         profile.password = item["password"] | "";
         profile.terminal = item["terminal"] | "xterm-256color";
+        profile.keyName = item["keyName"] | "";
+        profile.keyPassphrase = item["keyPassphrase"] | "";
         if (profile.name.length() && profile.host.length() && profile.user.length()) {
             config.ssh.push_back(profile);
         }
@@ -95,6 +101,28 @@ bool SettingsStore::load(AppConfig& config)
     config.system.region = doc["system"]["region"] | "Asia/Tokyo";
     config.system.utcOffsetMinutes = doc["system"]["utcOffsetMinutes"] | 540;
     config.system.ntpServer = doc["system"]["ntpServer"] | "pool.ntp.org";
+    config.wireguard.autoStart = doc["wireguard"]["autoStart"] | false;
+    config.wireguard.enabled = config.wireguard.autoStart; // an old saved "enabled" flag is ignored
+    config.wireguard.address = doc["wireguard"]["address"] | "";
+    config.wireguard.privateKey = doc["wireguard"]["privateKey"] | "";
+    config.wireguard.endpoint = doc["wireguard"]["endpoint"] | "";
+    config.wireguard.port = doc["wireguard"]["port"] | 51820;
+    config.wireguard.publicKey = doc["wireguard"]["publicKey"] | "";
+    config.wireguard.presharedKey = doc["wireguard"]["presharedKey"] | "";
+    config.wireguard.keepalive = doc["wireguard"]["keepalive"] | 0;
+    config.system.logSessions = doc["system"]["logSessions"] | false;
+    for (JsonObject item : doc["snippets"].as<JsonArray>()) {
+        Snippet snippet;
+        snippet.name = item["name"] | "";
+        snippet.text = item["text"] | "";
+        if (snippet.name.length() && snippet.text.length()) {
+            config.snippets.push_back(snippet);
+        }
+    }
+    config.ui.theme = doc["ui"]["theme"] | "tokyo-night";
+    config.ui.nav = doc["ui"]["nav"] | "top";
+    config.ui.scale = doc["ui"]["scale"] | 100;
+    if (config.ui.scale != 100 && config.ui.scale != 125 && config.ui.scale != 150) config.ui.scale = 100;
     config.activeWifi = doc["activeWifi"] | 0;
     config.activeSsh = doc["activeSsh"] | 0;
     if (config.activeWifi >= config.wifi.size()) {
@@ -126,6 +154,8 @@ bool SettingsStore::save(const AppConfig& config)
         item["user"] = profile.user;
         item["password"] = profile.password;
         item["terminal"] = profile.terminal;
+        item["keyName"] = profile.keyName;
+        item["keyPassphrase"] = profile.keyPassphrase;
     }
 
     doc["keyboard"]["layout"] = config.keyboard.layout;
@@ -147,15 +177,40 @@ bool SettingsStore::save(const AppConfig& config)
     doc["system"]["region"] = config.system.region;
     doc["system"]["utcOffsetMinutes"] = config.system.utcOffsetMinutes;
     doc["system"]["ntpServer"] = config.system.ntpServer;
+    doc["wireguard"]["autoStart"] = config.wireguard.autoStart;
+    doc["wireguard"]["address"] = config.wireguard.address;
+    doc["wireguard"]["privateKey"] = config.wireguard.privateKey;
+    doc["wireguard"]["endpoint"] = config.wireguard.endpoint;
+    doc["wireguard"]["port"] = config.wireguard.port;
+    doc["wireguard"]["publicKey"] = config.wireguard.publicKey;
+    doc["wireguard"]["presharedKey"] = config.wireguard.presharedKey;
+    doc["wireguard"]["keepalive"] = config.wireguard.keepalive;
+    doc["system"]["logSessions"] = config.system.logSessions;
+    JsonArray snippets = doc["snippets"].to<JsonArray>();
+    for (const auto& snippet : config.snippets) {
+        JsonObject item = snippets.add<JsonObject>();
+        item["name"] = snippet.name;
+        item["text"] = snippet.text;
+    }
+    doc["ui"]["theme"] = config.ui.theme;
+    doc["ui"]["nav"] = config.ui.nav;
+    doc["ui"]["scale"] = config.ui.scale;
     doc["activeWifi"] = config.activeWifi;
     doc["activeSsh"] = config.activeSsh;
 
+    // Serialize to memory first and write once: fewer flash erase cycles than many small writes.
+    String text;
+    serializeJsonPretty(doc, text);
     File file = LittleFS.open(kConfigPath, "w");
     if (!file) {
         _lastError = "profiles.json open for write failed";
         return false;
     }
-
-    serializeJsonPretty(doc, file);
+    const size_t written = file.print(text);
+    file.close();
+    if (written != text.length()) {
+        _lastError = "profiles.json write incomplete";
+        return false;
+    }
     return true;
 }
