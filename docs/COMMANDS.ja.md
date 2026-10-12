@@ -6,8 +6,7 @@ Tab5内蔵CLIは、ターミナル操作、SDカード、SSH/SCP、Wi-Fi制御�
 Linux風コマンドを提供します。完全なPOSIXシェルではありません。パイプ、リダイレクト、
 シェル展開、ジョブ制御、任意の外部コマンド実行はありません。
 
-短い一覧は `help`、内蔵コマンドの例は `man <command>` で確認できます。デモスクリプトの
-説明はSD上の `.txt` ファイルを `cat /mandel.txt` のように読んでください。
+短い一覧は `help`、内蔵コマンドの例は `man <command>` で確認できます。
 
 ## 基本
 
@@ -117,15 +116,7 @@ python /test.py
 スクリプト引数は `argv` として渡されます。対応している場合は `sys.argv` も設定します。
 
 スクリプトにはM5GFXスプライト描画用のグローバル `gfx` オブジェクトも渡されます。APIは
-[PYTHON.md](PYTHON.md)、デモは [DEMOS.ja.md](DEMOS.ja.md) を参照してください。
-
-Tab5上ではデモ説明ファイルを `cat` で読めます。
-
-```text
-cat /mandel.txt
-cat /plasma.txt
-cat /life.txt
-```
+[PYTHON.md](PYTHON.md) を参照してください。
 
 ## Bluetoothキーボード
 

@@ -1,7 +1,7 @@
 # Tab5 Python Mode
 
 The firmware embeds a MicroPython runtime for local REPL use, SD-card scripts,
-and graphics demos without replacing the SSH terminal firmware.
+and graphics scripts without replacing the SSH terminal firmware.
 
 ## Commands
 
@@ -32,8 +32,7 @@ print(argv)
 Example:
 
 ```text
-python /life.py 20 120
-python /mandel.py 0 1 8 -1
+python /script.py hello
 ```
 
 ## Graphics API
@@ -74,16 +73,14 @@ Colors are integer `0xRRGGBB` values.
 
 ## Stopping Graphics Scripts
 
-Graphics scripts are interrupted at `gfx.present()` so animations can remain
-responsive without adding input code to every demo. Press one of these keys:
+Graphics scripts are interrupted at `gfx.present()`. Press one of these keys:
 
 ```text
 Ctrl-C
 q
 ```
 
-`Ctrl-C` is the standard interrupt key. `q` is also accepted by the bundled
-graphics demos as a quick stop key. The runner reports the stop as
+`Ctrl-C` is the standard interrupt key. The runner reports the stop as
 `interrupted`.
 
 ## Drawing Model
@@ -94,25 +91,4 @@ The graphics API is intentionally sprite-based:
 2. The firmware draws into the M5GFX sprite.
 3. `gfx.present()` pushes the sprite to the display.
 
-This means scripts choose when the user sees updates. For construction demos
-such as `mandel.py` and `hat.py`, call `gfx.present()` after each row or pass.
-For animation demos such as `plasma.py`, draw a complete frame first and call
-`gfx.present()` once per frame.
-
-## Demo Scripts
-
-The repository contains SD-card demo scripts under `demos/`.
-
-```text
-python /mandel.py 0 1 8 -1
-python /plasma.py 0 160 16
-python /hat.py 5 1 -1
-python /life.py 0 500 10
-python /starfield.py 0 120 7
-python /maze.py 10 25 17
-```
-
-These demos use `gfx`, so they are graphical M5GFX drawing demos rather than
-ASCII-art terminal output.
-
-See [DEMOS.md](DEMOS.md) for arguments and behavior.
+Scripts choose when drawing commands become visible by calling `gfx.present()`.

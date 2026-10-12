@@ -8,8 +8,7 @@ It is not a full POSIX shell: pipelines, redirection, shell expansion, job
 control, and arbitrary external commands are not implemented.
 
 Use `help` on the Tab5 for a short list and `man <command>` for examples of
-built-in commands. Demo scripts have `.txt` help files on SD, such as
-`cat /mandel.txt`.
+built-in commands.
 
 ## General
 
@@ -39,6 +38,28 @@ built-in commands. Demo scripts have `.txt` help files on SD, such as
 | `ip addr` | Show the Tab5 network address. | `ip addr` |
 | `ip a` | Alias of `ip addr`. | `ip a` |
 | `ifconfig` | Network status display. | `ifconfig` |
+
+### WireGuard
+
+| Command | Description | Example |
+| --- | --- | --- |
+| `wg status` | Show tunnel state without displaying keys. | `wg status` |
+| `wg set <field> <value>` | Save `address`, `private-key`, `endpoint`, `port`, or `public-key`. | `wg set endpoint vpn.example.net` |
+| `wg on` | Start after Wi-Fi and NTP are ready. | `wg on` |
+| `wg off` | Stop the tunnel and disable automatic restart. | `wg off` |
+| `wg reset` | Clear the saved tunnel configuration. | `wg reset` |
+| `wg import <sd-path>` | Import a wg-quick `.conf` from the SD card. | `wg import /wg/home.conf` |
+| `wg remote [stop]` | Start or stop the temporary setup web page (shows URL and PIN). | `wg remote` |
+| `sshkey list` | List stored SSH keys. | `sshkey list` |
+| `sshkey gen [name]` | Generate an ed25519 key and print its public key. | `sshkey gen laptop` |
+| `sshkey pub <name>` | Print the public key line. | `sshkey pub laptop` |
+| `sshkey import <sd-path> [name]` | Import a private key from the SD card. | `sshkey import /ssh/id_ed25519 main` |
+| `sshkey use <name> [profile]` | Use a key for an SSH profile (default: active). | `sshkey use main 0` |
+| `sshkey rm <name>` | Delete a key. | `sshkey rm laptop` |
+| `theme [list\|<id>]` | List or switch color schemes. | `theme nord` |
+
+WireGuard currently uses one IPv4 peer and a full IPv4 tunnel. `wg status`
+reports whether the handshake completed. See [WireGuard setup](../README.md#wireguard).
 
 ## SSH
 
@@ -122,16 +143,7 @@ Script arguments are exposed as `argv`; the firmware also tries to set
 `sys.argv` when supported.
 
 Scripts receive a global `gfx` object for M5GFX sprite drawing. See
-[PYTHON.md](PYTHON.md) for the graphics API and [DEMOS.md](DEMOS.md) for demo
-scripts.
-
-On the Tab5, demo help files can be read with `cat`:
-
-```text
-cat /mandel.txt
-cat /plasma.txt
-cat /life.txt
-```
+[PYTHON.md](PYTHON.md) for the graphics API.
 
 ## Bluetooth Keyboard
 

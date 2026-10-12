@@ -10,6 +10,7 @@ Wi-Fi.
 
 - PlatformIO project for M5Stack Tab5 / ESP32-P4.
 - On-device Wi-Fi and SSH profile management persisted to flash.
+- Single-peer WireGuard IPv4 tunnel for SSH over a VPN.
 - Direct SSH command: `ssh user@host[:port] [password]`.
 - Interactive SSH shell using `LibSSH-ESP32`.
 - ANSI/VT-style terminal handling for shells, `vim`, `nano`, `sl`, and similar apps.
@@ -20,16 +21,12 @@ Wi-Fi.
 - Linux-like local CLI for SD files, Wi-Fi, SSH/SCP, diagnostics, and Python.
 - Embedded MicroPython runner for REPL, `python -c`, and SD-card scripts.
 - MicroPython graphics API backed by the firmware M5GFX sprite.
-- SD-card demos: progressive Mandelbrot, sine plasma, wireframe hat, Life,
-  starfield, and maze.
 
 ## Documentation
 
 - [Command list](docs/COMMANDS.md)
 - [コマンド一覧](docs/COMMANDS.ja.md)
 - [Python and graphics](docs/PYTHON.md)
-- [Demo scripts](docs/DEMOS.md)
-- [デモスクリプト](docs/DEMOS.ja.md)
 - [Third-party licenses](THIRD_PARTY_LICENSES.md)
 
 ## Hardware
@@ -79,10 +76,16 @@ local profile file for the LittleFS image, then restores the public
 
 Profiles can be edited on the Tab5 UI and are persisted to flash.
 
-- `WIFI`: saved Wi-Fi profiles, scan, add, edit, connect, Wi-Fi on/off.
-- `SSH`: saved SSH profiles, add, edit, connect.
-- `FONT`: terminal font and line spacing.
-- `CONF`: device name, region, UTC offset, NTP, keymap, and related settings.
+- `WIFI`: saved Wi-Fi profiles, scan, add, edit, delete, connect, Wi-Fi on/off.
+- `BT`: Bluetooth keyboard on/off, scan, pair, forget, choose the active device.
+- `WG`: WireGuard status, on/off, import a `.conf` from the SD card, set up from another device, edit fields.
+- `SSH`: saved SSH profiles (add, edit, delete, connect) and the `KEYS` page for SSH key login.
+- `THEME`: 12 color schemes, terminal font size, interface text size (Normal/Large/X-Large), and line
+  spacing. Pick what you want, then tap `APPLY`; nothing changes (or redraws) until you do.
+- `SSH` > `SNIPPETS`: saved commands; `RUN` sends the command plus Enter to the open session.
+- `CONF`: device name, region, UTC offset, NTP, keymap, Ctrl/Caps swap, navigation (`top` tab strip or
+  `side` rail), and session logging (SSH output saved to `/logs` on the SD card). Fields with a `v`
+  button have a dropdown list; most also accept typed values.
 
 Do not commit real Wi-Fi passwords or SSH credentials.
 
@@ -132,15 +135,12 @@ ssh connect 0
 ssh user@host[:port] [password]
 ls /
 ls -lah /
-cat /life.txt
 df
 mkdir /scripts
 rmdir /scripts
 scp get /home/demo/test.py /test.py 0
 scp put /test.py /home/demo/test.py 0
-python /life.py
-python /mandel.py 0 1 8 -1
-python /plasma.py 0 160 16
+python -c print('hello')
 ```
 
 Normal `ls` uses multi-column output; `ls -l` uses one file per line.
@@ -152,15 +152,14 @@ The local CLI can start the embedded REPL or run `.py` files from microSD:
 ```text
 python
 python -c print('hello')
-python /life.py
+python -c print('hello')
 ```
 
 Scripts receive `argv` and a global `gfx` object. Drawing commands render into
 the firmware sprite, and `gfx.present()` pushes that sprite to the display.
 Graphics scripts can be interrupted at `gfx.present()` with `Ctrl-C` or `q`.
 
-See [docs/PYTHON.md](docs/PYTHON.md) for the API and
-[docs/DEMOS.md](docs/DEMOS.md) for bundled demo scripts.
+See [docs/PYTHON.md](docs/PYTHON.md) for the API.
 
 ## Tailscale Hosts
 
@@ -168,6 +167,76 @@ This firmware does not run a Tailscale node on the ESP32-P4. To connect to a
 tailnet host, put the Tab5 on a network that has a Tailscale gateway, subnet
 router, tethered Tailscale device, or SSH relay, then configure the SSH profile
 with the reachable address and port.
+
+## Host keys
+
+The first key a server presents is saved to `/known_hosts` (trust on first use). If it later
+changes, the connection is refused and the message says how to accept the new key:
+`sshhost forget <host[:port]>`. `sshhost list` shows what is trusted. An idle session sends an
+SSH keepalive every 30 seconds.
+
+## SSH keys
+
+Open `SSH` > `KEYS`. Keys are stored in the Tab5's internal flash (`/keys`), never on the SD card.
+
+- `GENERATE` creates an ed25519 key; its public key is shown, printed in the `TERM` tab and serial
+  log, and copied to `/ssh/<name>.pub` on the SD card.
+- Existing keys can be imported from the SD card (`/ssh`, `/.ssh`, `/keys`, or `id_*` in the root)
+  or uploaded through `REMOTE SETUP`; that page can also download the public keys.
+- `USE FOR SSH` assigns the selected key to the active SSH profile (or pick it in the profile's
+  `SSH key` dropdown). If the key is rejected, the profile's password is tried when one is set.
+- Encrypted keys: enter the passphrase in the profile's `Key pass` field.
+
+CLI: `sshkey list|gen [name]|pub <name>|rm <name>|import <sd-path> [name]|use <name> [profile]`.
+
+## WireGuard
+
+WireGuard is always off after boot and after a new config is saved or imported. Turn it on with
+`WG ON` (or `wg on`), or set `CONF` > `WG at boot` to `Always on` to start it automatically.
+
+The easiest way is the `WG` tab. Either copy a standard `wg-quick` `.conf` file to the SD card
+(`/wg` is searched first; `RESCAN SD` searches every folder, and only files that really contain a WireGuard `[Interface]` are listed) and tap it in the list, or tap `REMOTE SETUP`: the Tab5 serves a
+page on your Wi-Fi (`http://<tab5-ip>:8080`) where you paste or upload the `.conf` from a phone or
+laptop. The page needs the PIN shown on the Tab5, closes after one upload, after five wrong PINs,
+or after five minutes. It uses plain HTTP, so use it only on a network you trust. A `PresharedKey`
+and `PersistentKeepalive` in the file are honoured; only the first `[Peer]` is used.
+
+You can also configure a WireGuard peer through the local CLI or the 115200 baud serial API.
+The server must have a peer entry for this Tab5's public key and tunnel IP.
+Use the address from the client `[Interface] Address` line without its CIDR
+suffix, and use the server `[Peer] Endpoint` host and port.
+
+```text
+wg set address 10.13.13.2
+wg set private-key <client-private-key-base64>
+wg set endpoint vpn.example.net
+wg set port 51820
+wg set public-key <server-public-key-base64>
+wg on
+wg status
+```
+
+`wg off` closes the tunnel; `wg reset` clears its saved settings. Settings persist in LittleFS, and an enabled tunnel
+restarts after Wi-Fi reconnects and NTP has set the clock. `wg status` says
+"interface up; waiting for handshake" once the network interface starts and
+"connected (handshake ok)" after the peer has answered. Test access by connecting to an SSH
+host reachable only through the tunnel.
+
+This implementation supports one IPv4 peer, routes all outgoing IPv4 traffic
+through it while active, and does not support preshared keys or custom
+AllowedIPs. It uses the BSD-licensed WireGuard-ESP32-Arduino lwIP implementation
+with an ESP-IDF 5.5 compatibility change. Keys are stored in the same
+unencrypted LittleFS settings file as Wi-Fi and SSH credentials. Serial command
+echo redacts `wg set private-key`, but avoid sharing serial logs containing
+other credentials.
+
+## Tab5 Hardware Revisions
+
+M5Stack reports a change from ILI9881C display plus GT911 touch to integrated
+ST7123 on October 14, 2025, then ST7121 on April 28, 2026. This project
+uses M5Unified and M5GFX auto detection; M5Stack specifies M5Unified 0.2.23+
+and M5GFX 0.2.30+ for stable reset on the newer panels. The build currently
+resolves 0.2.25 and 0.2.32. See the [official Tab5 hardware notes](https://docs.m5stack.com/en/core/Tab5).
 
 ## Serial Diagnostics
 
@@ -192,7 +261,6 @@ transitions because they may reset the board.
 
 ```text
 data/       LittleFS profile data
-demos/      SD-card Python demo scripts and text help
 docs/       Documentation
 include/    Headers
 lib/        Embedded MicroPython and local libraries

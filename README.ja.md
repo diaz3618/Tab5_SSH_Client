@@ -19,16 +19,12 @@ PlatformIO、対象は Tab5、Tab5 Keyboard、microSD、Wi-Fi です。
 - SD操作、Wi-Fi、SSH/SCP、診断、Python実行用のLinux風ローカルCLI。
 - MicroPython REPL、`python -c`、SD上の `.py` 実行。
 - M5GFXスプライトを使うMicroPython向け `gfx` 描画API。
-- progressive Mandelbrot、sine plasma、wireframe hat、Life、starfield、
-  maze などのSDカードデモ。
 
 ## ドキュメント
 
 - [Command list](docs/COMMANDS.md)
 - [コマンド一覧](docs/COMMANDS.ja.md)
 - [Python and graphics](docs/PYTHON.md)
-- [Demo scripts](docs/DEMOS.md)
-- [デモスクリプト](docs/DEMOS.ja.md)
 - [Third-party licenses](THIRD_PARTY_LICENSES.md)
 
 ## 必要なハードウェア
@@ -131,15 +127,12 @@ ssh connect 0
 ssh user@host[:port] [password]
 ls /
 ls -lah /
-cat /life.txt
 df
 mkdir /scripts
 rmdir /scripts
 scp get /home/demo/test.py /test.py 0
 scp put /test.py /home/demo/test.py 0
-python /life.py
-python /mandel.py 0 1 8 -1
-python /plasma.py 0 160 16
+python -c print('hello')
 ```
 
 通常の `ls` は複数列表示、`ls -l` は1ファイル1行の詳細表示です。
@@ -151,15 +144,14 @@ python /plasma.py 0 160 16
 ```text
 python
 python -c print('hello')
-python /life.py
+python -c print('hello')
 ```
 
 スクリプトには `argv` とグローバルな `gfx` オブジェクトが渡されます。描画命令は
 ファームウェア側のスプライトに描き、`gfx.present()` で画面へ転送します。
 描画スクリプトは `gfx.present()` のタイミングで `Ctrl-C` または `q` により中断できます。
 
-APIは [docs/PYTHON.md](docs/PYTHON.md)、同梱デモは
-[docs/DEMOS.ja.md](docs/DEMOS.ja.md) を参照してください。
+APIは [docs/PYTHON.md](docs/PYTHON.md) を参照してください。
 
 ## Tailscaleホストへの接続
 
@@ -191,7 +183,6 @@ python /life.py 0 5
 
 ```text
 data/       LittleFSプロファイルデータ
-demos/      SDカード用Pythonデモと説明テキスト
 docs/       ドキュメント
 include/    ヘッダ
 lib/        組み込みMicroPythonとローカルライブラリ

@@ -79,7 +79,7 @@ Suggested description:
 Portable SSH terminal firmware for M5Stack Tab5 with Tab5 Keyboard. Includes
 Wi-Fi and SSH profile management, Tab5sh Linux-like shell, adjustable terminal
 fonts, microSD filesystem commands, SCP file transfer, embedded MicroPython,
-and an M5GFX-backed graphics API for Python demos.
+and an M5GFX-backed graphics API for Python scripts.
 ```
 
 5. Click `Upload`.
