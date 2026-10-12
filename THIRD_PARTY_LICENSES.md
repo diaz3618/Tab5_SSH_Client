@@ -17,6 +17,14 @@ files in each upstream project are authoritative.
 | ArduinoJson | JSON profile/config parsing | MIT | PlatformIO dependency: `bblanchon/ArduinoJson` |
 | LibSSH-ESP32 | SSH and SCP client support | LGPL-2.1-or-later, based on libssh | PlatformIO dependency: `ewpa/LibSSH-ESP32` |
 
+## WireGuard
+
+`lib/wireguard_esp32` is based on WireGuard-ESP32-Arduino 0.1.5 by Kenta Ida,
+which incorporates Daniel Hope's wireguard-lwIP implementation. It is licensed
+under BSD-3-Clause; see the included `LICENSE`. The Tab5 copy uses the current
+lwIP default interface for its underlying Wi-Fi link instead of the removed
+`tcpip_adapter` API.
+
 ## Embedded MicroPython
 
 The firmware includes a local embedded MicroPython runtime under
