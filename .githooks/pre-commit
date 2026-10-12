@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Enable with: git config core.hooksPath .githooks
+set -e
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+if echo "$staged" | grep -qE '(^|/)\.env($|\.)|profiles\.local\.json$|(^|/)secrets/|\.(pem|key|ppk)$|(^|/)id_(rsa|ed25519|ecdsa)$'; then
+  echo "pre-commit: refusing to commit an env, key or local-profile file" >&2
+  exit 1
+fi
+if git diff --cached -U0 | grep -E '^\+' | grep -qE '^\+\s*-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+  echo "pre-commit: staged changes contain a private key" >&2
+  exit 1
+fi
+# data/profiles.json is flashed to the device: it must keep its placeholder credentials
+if echo "$staged" | grep -qx 'data/profiles.json' \
+  && git show :data/profiles.json | grep -E '"(password|ssid)"' | grep -vqE 'YOUR_[A-Z_]+'; then
+  echo "pre-commit: data/profiles.json has real Wi-Fi/SSH credentials; keep the YOUR_* placeholders" >&2
+  exit 1
+fi
+if command -v gitleaks >/dev/null; then
+  gitleaks protect --staged --no-banner
+fi
