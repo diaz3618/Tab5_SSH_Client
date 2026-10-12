@@ -1,4 +1,7 @@
 #include "SshClient.hpp"
+#include "SshKeys.hpp"
+
+#include <LittleFS.h>
 
 #if ENABLE_SSH
 #include <libssh_esp32.h>
@@ -25,6 +28,98 @@ void ensureLibsshStarted()
     }
 }
 
+constexpr const char* kKnownHostsPath = "/known_hosts";
+
+// Trust on first use: the first key seen for host:port is stored; a different key later is refused.
+bool verifyHostKey(ssh_session session, const SshProfile& profile, String& error)
+{
+    ssh_key key = nullptr;
+    if (ssh_get_server_publickey(session, &key) != SSH_OK || !key) {
+        error = "server sent no host key";
+        return false;
+    }
+    unsigned char* hash = nullptr;
+    size_t hashLen = 0;
+    const int rc = ssh_get_publickey_hash(key, SSH_PUBLICKEY_HASH_SHA256, &hash, &hashLen);
+    ssh_key_free(key);
+    if (rc != 0 || !hash) {
+        error = "cannot hash host key";
+        return false;
+    }
+    char* fp = ssh_get_fingerprint_hash(SSH_PUBLICKEY_HASH_SHA256, hash, hashLen);
+    ssh_clean_pubkey_hash(&hash);
+    if (!fp) {
+        error = "cannot format host key";
+        return false;
+    }
+    const String fingerprint(fp);
+    ssh_string_free_char(fp);
+    const String entry = profile.host + ":" + profile.port;
+
+    String stored;
+    File in = LittleFS.open(kKnownHostsPath, "r");
+    if (in) {
+        while (in.available()) {
+            String line = in.readStringUntil('\n');
+            line.trim();
+            if (line.startsWith(entry + " ")) {
+                stored = line.substring(entry.length() + 1);
+                break;
+            }
+        }
+        in.close();
+    }
+    if (stored.length()) {
+        if (stored == fingerprint) {
+            return true;
+        }
+        error = "HOST KEY CHANGED for " + entry + " (was " + stored + ", now " + fingerprint +
+                "). If this is expected run: sshhost forget " + entry;
+        return false;
+    }
+    File out = LittleFS.open(kKnownHostsPath, "a");
+    if (out) {
+        out.println(entry + " " + fingerprint);
+        out.close();
+    }
+    reportSshStage((String("new host key trusted ") + fingerprint).c_str());
+    return true;
+}
+
+bool authenticate(ssh_session session, const SshProfile& profile, String& error)
+{
+    String keyError;
+    if (profile.keyName.length()) {
+        String pem;
+        if (!SshKeys::read(profile.keyName, pem)) {
+            keyError = "key '" + profile.keyName + "' not found";
+        } else {
+            ssh_key key = nullptr;
+            if (ssh_pki_import_privkey_base64(pem.c_str(),
+                                              profile.keyPassphrase.length() ? profile.keyPassphrase.c_str() : nullptr,
+                                              nullptr, nullptr, &key) != SSH_OK || !key) {
+                keyError = "cannot load key '" + profile.keyName + "' (passphrase or format)";
+            } else {
+                const int rc = ssh_userauth_publickey(session, nullptr, key);
+                ssh_key_free(key);
+                if (rc == SSH_AUTH_SUCCESS) {
+                    return true;
+                }
+                keyError = String("key rejected: ") + ssh_get_error(session);
+            }
+        }
+        if (!profile.password.length()) {
+            error = keyError;
+            return false;
+        }
+    }
+    if (ssh_userauth_password(session, nullptr, profile.password.c_str()) == SSH_AUTH_SUCCESS) {
+        return true;
+    }
+    error = keyError.length() ? keyError + "; password: " + ssh_get_error(session) : String(ssh_get_error(session));
+    return false;
+}
+
 ssh_session openSession(const SshProfile& profile, String& error)
 {
     ensureLibsshStarted();
@@ -44,8 +139,7 @@ ssh_session openSession(const SshProfile& profile, String& error)
         ssh_free(session);
         return nullptr;
     }
-    if (ssh_userauth_password(session, nullptr, profile.password.c_str()) != SSH_AUTH_SUCCESS) {
-        error = ssh_get_error(session);
+    if (!verifyHostKey(session, profile, error) || !authenticate(session, profile, error)) {
         ssh_disconnect(session);
         ssh_free(session);
         return nullptr;
@@ -92,6 +186,8 @@ bool SshClient::connect(const SshProfile& profile, String& error, int columns, i
 
     reportSshStage("ssh_options");
     const int verbosity = SSH_LOG_NOLOG;
+    const long connectTimeoutSeconds = 8; // bound the blocking connect so the UI cannot hang for minutes
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &connectTimeoutSeconds);
     ssh_options_set(session, SSH_OPTIONS_HOST, profile.host.c_str());
     const int port = profile.port;
     ssh_options_set(session, SSH_OPTIONS_PORT, &port);
@@ -105,10 +201,15 @@ bool SshClient::connect(const SshProfile& profile, String& error, int columns, i
         return false;
     }
 
-    reportSshStage("ssh_auth_password");
-    int auth = ssh_userauth_password(session, nullptr, profile.password.c_str());
-    if (auth != SSH_AUTH_SUCCESS) {
-        error = ssh_get_error(session);
+    reportSshStage("ssh_hostkey");
+    if (!verifyHostKey(session, profile, error)) {
+        ssh_disconnect(session);
+        ssh_free(session);
+        return false;
+    }
+
+    reportSshStage(profile.keyName.length() ? "ssh_auth_key" : "ssh_auth_password");
+    if (!authenticate(session, profile, error)) {
         ssh_disconnect(session);
         ssh_free(session);
         return false;
@@ -137,6 +238,7 @@ bool SshClient::connect(const SshProfile& profile, String& error, int columns, i
     ssh_set_blocking(session, 0);
     _session = session;
     _channel = channel;
+    _lastKeepalive = millis();
     reportSshStage("ssh_ready");
     return true;
 #else
@@ -372,4 +474,54 @@ bool SshClient::scpUpload(const SshProfile& profile, fs::FS& fs, const String& l
     error = "ENABLE_SSH is disabled";
     return false;
 #endif
+}
+
+void SshClient::keepAlive()
+{
+#if ENABLE_SSH
+    if (!_session || millis() - _lastKeepalive < 30000) {
+        return;
+    }
+    _lastKeepalive = millis();
+    ssh_send_ignore(static_cast<ssh_session>(_session), "keepalive");
+#endif
+}
+
+String SshClient::knownHostsList()
+{
+    File in = LittleFS.open("/known_hosts", "r");
+    return in ? in.readString() : String("");
+}
+
+bool SshClient::forgetHost(const String& hostSpec)
+{
+    String spec = hostSpec;
+    spec.trim();
+    if (spec.indexOf(':') < 0) {
+        spec += ":22";
+    }
+    File in = LittleFS.open("/known_hosts", "r");
+    if (!in) {
+        return false;
+    }
+    String kept;
+    bool removed = false;
+    while (in.available()) {
+        String line = in.readStringUntil('\n');
+        line.trim();
+        if (!line.length()) continue;
+        if (line.startsWith(spec + " ")) {
+            removed = true;
+        } else {
+            kept += line + "\n";
+        }
+    }
+    in.close();
+    if (removed) {
+        File out = LittleFS.open("/known_hosts", "w");
+        if (out) {
+            out.print(kept);
+        }
+    }
+    return removed;
 }
