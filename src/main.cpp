@@ -1,10 +1,14 @@
+#include "RemoteSetup.hpp"
 #include "SettingsStore.hpp"
+#include "SshKeys.hpp"
+#include "Themes.hpp"
 #include "PythonRunner.hpp"
 #include "SshClient.hpp"
 #include "Tab5KeyboardInput.hpp"
 #include "TerminalBuffer.hpp"
 #include "TerminalEmulator.hpp"
 #include "WifiProfiles.hpp"
+#include "WireGuardRuntime.hpp"
 #include "fonts/TerminusBitmap.hpp"
 
 #include <FS.h>
@@ -25,6 +29,8 @@ namespace {
 AppConfig config;
 SettingsStore settings;
 WifiProfiles wifiProfiles;
+WireGuardRuntime wireguard;
+RemoteSetup remoteSetup;
 SshClient ssh;
 PythonRunner python;
 Tab5KeyboardInput keyboard;
@@ -43,7 +49,13 @@ enum class Screen : uint8_t {
     WifiScan,
     SshList,
     SshEdit,
-    FontList,
+    SshKeys,
+    SnipList,
+    SnipEdit,
+    BtPage,
+    WgPage,
+    WgEdit,
+    ThemeList,
     ConfigEdit,
 };
 
@@ -82,6 +94,9 @@ bool editIsNew = false;
 uint32_t lastDraw = 0;
 bool dirty = true;
 bool headerDirty = false;
+bool lastDrawWasLocalTerminal = false;
+uint32_t lastDrawnTerminalGeneration = UINT32_MAX;
+size_t lastDrawnEditorRow = SIZE_MAX;
 String statusLine = "booting";
 std::vector<ScannedNetwork> scannedNetworks;
 size_t settingScrollOffset = 0;
@@ -96,11 +111,13 @@ size_t wifiProfileIndex = 0;
 uint32_t wifiAttemptStart = 0;
 uint32_t wifiRetryAt = 0;
 uint32_t wifiAttemptTimeoutMs = 20000;
-int16_t wifiLastRetrySecond = -1;
 uint8_t wifiLastDisconnectReason = 0;
 String wifiLastDisconnectName;
 String wifiLastFailureText;
 String wifiStatusText = "Wi-Fi idle";
+String connectedSsidCache; // WiFi.SSID() is a slow call to the Wi-Fi coprocessor; ask once per connection
+uint32_t lastInputMs = 0;  // last touch or key, used to keep flash writes out of the way
+uint32_t saveDueAt = 0;    // deferred config save (0 = none pending)
 String wifiWorkerSsid;
 String wifiWorkerPassword;
 volatile bool wifiWorkerBusy = false;
@@ -135,9 +152,54 @@ bool pythonReplMode = false;
 int touchScrollRemainderY = 0;
 bool touchScrollActive = false;
 bool remoteLineMode = false;
-uint32_t lastCursorBlink = 0;
+String currentSshHost = "ssh";
 bool cursorVisible = true;
 uint32_t lastSshReceive = 0;
+enum PerfPhase : uint8_t { PerfM5, PerfSerial, PerfTouch, PerfKeyboard, PerfWifi, PerfWireguard, PerfSsh, PerfDraw, PerfCount };
+const char* const PerfNames[PerfCount] = {"m5", "serial", "touch", "keyboard", "wifi", "wireguard", "ssh", "draw"};
+struct PerfSample { uint32_t totalUs{0}; uint32_t maxUs{0}; uint32_t calls{0}; };
+PerfSample perfCurrent[PerfCount];
+PerfSample perfLast[PerfCount];
+uint32_t perfWindowStart = 0;
+uint32_t perfLoopCount = 0;
+uint32_t perfLastLoopCount = 0;
+uint32_t lastDrawBuildUs = 0;
+uint32_t lastDrawPushUs = 0;
+
+void perfAdd(PerfPhase phase, uint32_t startUs)
+{
+    const uint32_t elapsed = micros() - startUs;
+    auto& sample = perfCurrent[phase];
+    sample.totalUs += elapsed;
+    sample.maxUs = max(sample.maxUs, elapsed);
+    ++sample.calls;
+}
+
+void perfSnapshot()
+{
+    const uint32_t now = millis();
+    if (now - perfWindowStart < 1000) return;
+    for (size_t i = 0; i < PerfCount; ++i) {
+        perfLast[i] = perfCurrent[i];
+        perfCurrent[i] = {};
+    }
+    perfLastLoopCount = perfLoopCount;
+    perfLoopCount = 0;
+    perfWindowStart = now;
+}
+
+void serialPrintPerf()
+{
+    Serial.printf("perf loops=%lu drawBuild=%luus drawPush=%luus\r\n",
+                  static_cast<unsigned long>(perfLastLoopCount),
+                  static_cast<unsigned long>(lastDrawBuildUs), static_cast<unsigned long>(lastDrawPushUs));
+    for (size_t i = 0; i < PerfCount; ++i) {
+        const auto& p = perfLast[i];
+        Serial.printf("perf %s total=%luus max=%luus calls=%lu\r\n", PerfNames[i],
+                      static_cast<unsigned long>(p.totalUs), static_cast<unsigned long>(p.maxUs),
+                      static_cast<unsigned long>(p.calls));
+    }
+}
 RTC_DATA_ATTR uint32_t crashStageMagic = 0;
 RTC_DATA_ATTR char crashStage[64] = "";
 
@@ -155,24 +217,34 @@ constexpr int HeaderH = 44;
 constexpr int HeaderTouchH = HeaderH * 3;
 constexpr int ContentTopGap = 56;
 
-constexpr Rect BtnTerminal{4, 4, 72, 36};
-constexpr Rect BtnWifi{82, 4, 72, 36};
-constexpr Rect BtnSsh{160, 4, 72, 36};
-constexpr Rect BtnFont{238, 4, 72, 36};
-constexpr Rect BtnConfig{316, 4, 72, 36};
-constexpr Rect BtnConnect{402, 4, 80, 36};
-constexpr Rect BtnAdd{402, 4, 72, 36};
-constexpr Rect BtnMinus{480, 4, 72, 36};
-constexpr Rect BtnPlus{558, 4, 72, 36};
-constexpr Rect BtnSave{636, 4, 72, 36};
-constexpr Rect BtnDelete{714, 4, 72, 36};
-constexpr Rect BodyBtn1{8, HeaderH + ContentTopGap, 112, 48};
-constexpr Rect BodyBtn2{132, HeaderH + ContentTopGap, 112, 48};
-constexpr Rect BodyBtn3{256, HeaderH + ContentTopGap, 150, 48};
-constexpr Rect BodyBtn4{418, HeaderH + ContentTopGap, 112, 48};
-constexpr Rect FontMinusBtn{8, HeaderH + ContentTopGap, 112, 48};
-constexpr Rect FontPlusBtn{132, HeaderH + ContentTopGap, 112, 48};
-constexpr Rect FontSaveBtn{256, HeaderH + ContentTopGap, 150, 48};
+// Navigation: a tab strip along the top, or a rail down the left (config: ui.nav).
+// navW is the rail width (0 when the tabs are on top); all content is offset by it.
+constexpr int RailW = 132;
+constexpr int RailTabH = 56;
+constexpr int TabCount = 7;
+constexpr int TabW = 76;
+constexpr int TabGap = 4;
+int navW = 0;
+Rect tabRect(int i)
+{
+    if (navW) {
+        return Rect{6, 8 + i * (RailTabH + 4), navW - 12, RailTabH};
+    }
+    return Rect{4 + i * (TabW + TabGap), 4, TabW, 36};
+}
+// Context buttons beside the tabs: slot 0 = CONN, 1 = SAVE, 2 = DEL.
+Rect ctxBtn(int slot)
+{
+    const int base = navW ? navW + 8 : 580;
+    return Rect{base + slot * 86, 4, slot == 0 ? 80 : 72, 36};
+}
+constexpr int BodyBtnW = 124;
+constexpr int BodyBtnGap = 8;
+Rect bodyBtn(int i)
+{
+    const int w = BodyBtnW + static_cast<int>((config.ui.scale - 100) * 2);
+    return Rect{navW + 8 + i * (w + BodyBtnGap), HeaderH + ContentTopGap, w, 48};
+}
 
 bool connectSshProfile(const SshProfile& profile);
 bool parseSshCommand(const String& line, SshProfile& profile, String& error);
@@ -182,6 +254,7 @@ bool parseTrailingIndex(const String& command, size_t prefixLen, size_t& index);
 void configureTerminal();
 void draw();
 bool saveConfig();
+void scheduleSave();
 bool sendSshText(const String& text);
 void appendStatus(const String& message);
 void handleAction(const KeyAction& action);
@@ -189,6 +262,8 @@ void startTimeSync(bool force = false);
 void setWifiStatus(const String& message);
 void startWifiReconnect(uint32_t timeoutMs = 20000);
 void stopWifiRuntime();
+String runWireGuardCommand(const String& command);
+String runExtraCommand(const String& command);
 void enableWifiRuntime(uint32_t timeoutMs = 20000);
 bool drawFallbackUnicodeGlyph(uint32_t cp, int x, int y, int w, int h, uint16_t fg, uint16_t bg);
 void drawHeader();
@@ -198,6 +273,9 @@ extern "C" int tab5_python_gfx_height();
 
 bool headerButtonContains(const Rect& r, int px, int py)
 {
+    if (navW && r.x < navW) {
+        return r.contains(px, py);
+    }
     return px >= r.x && px < r.x + r.w && py >= 0 && py < HeaderTouchH;
 }
 
@@ -307,7 +385,9 @@ extern "C" bool tab5_python_gfx_command(const char* command)
     }
     if (op == "present") {
         drawHeader();
+        M5.Display.setRotation(0);
         screenSprite.pushSprite(0, 0);
+        M5.Display.setRotation(3);
         dirty = false;
         headerDirty = false;
         if (pollPythonAbortInput()) {
@@ -399,24 +479,23 @@ extern "C" bool tab5_python_gfx_command(const char* command)
 
 const Rect* headerButtonAt(size_t index)
 {
+    static Rect slot;
     size_t i = 0;
-    if (index == i++) return &BtnTerminal;
-    if (index == i++) return &BtnWifi;
-    if (index == i++) return &BtnSsh;
-    if (index == i++) return &BtnFont;
-    if (index == i++) return &BtnConfig;
-
+    for (int t = 0; t < TabCount; ++t) {
+        if (index == i++) { slot = tabRect(t); return &slot; }
+    }
+    int ctx[3] = {-1, -1, -1};
     if (screen == Screen::Terminal) {
-        if (index == i++) return &BtnConnect;
+        ctx[0] = 0;
     } else if (screen == Screen::WifiEdit) {
-        if (index == i++) return &BtnConnect;
-        if (index == i++) return &BtnSave;
-        if (index == i++) return &BtnDelete;
+        ctx[0] = 0; ctx[1] = 1; ctx[2] = 2;
     } else if (screen == Screen::SshEdit) {
-        if (index == i++) return &BtnSave;
-        if (index == i++) return &BtnDelete;
-    } else if (screen == Screen::ConfigEdit) {
-        if (index == i++) return &BtnSave;
+        ctx[1] = 1; ctx[2] = 2;
+    } else if (screen == Screen::ConfigEdit || screen == Screen::WgEdit || screen == Screen::SnipEdit) {
+        ctx[1] = 1;
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (ctx[k] >= 0 && index == i++) { slot = ctxBtn(ctx[k]); return &slot; }
     }
     return nullptr;
 }
@@ -444,12 +523,17 @@ void focusCurrentScreenButton()
 {
     if (screen == Screen::WifiList || screen == Screen::WifiEdit || screen == Screen::WifiScan) {
         focusedHeaderButton = 1;
-    } else if (screen == Screen::SshList || screen == Screen::SshEdit) {
+    } else if (screen == Screen::BtPage) {
         focusedHeaderButton = 2;
-    } else if (screen == Screen::FontList) {
+    } else if (screen == Screen::WgPage || screen == Screen::WgEdit) {
         focusedHeaderButton = 3;
-    } else if (screen == Screen::ConfigEdit) {
+    } else if (screen == Screen::SshList || screen == Screen::SshEdit || screen == Screen::SshKeys ||
+               screen == Screen::SnipList || screen == Screen::SnipEdit) {
         focusedHeaderButton = 4;
+    } else if (screen == Screen::ThemeList) {
+        focusedHeaderButton = 5;
+    } else if (screen == Screen::ConfigEdit) {
+        focusedHeaderButton = 6;
     } else {
         focusedHeaderButton = 0;
     }
@@ -469,10 +553,10 @@ struct TerminalFontOption {
 };
 
 constexpr TerminalFontOption TerminalFonts[] = {
-    {"mono9", "Terminus 8x16", &fonts::lgfxJapanGothic_16, 8, 16, 18, 18, 12, 20},
-    {"mono12", "Terminus 10x20", &fonts::lgfxJapanGothic_20, 10, 20, 22, 22, 15, 26},
-    {"mono18", "Terminus 14x28", &fonts::lgfxJapanGothic_28, 14, 28, 30, 30, 23, 38},
-    {"mono24", "Terminus 18x36", &fonts::lgfxJapanGothic_36, 18, 36, 38, 38, 30, 50},
+    {"mono9", "Small 8x16", &fonts::lgfxJapanGothic_16, 8, 16, 18, 18, 12, 20},
+    {"mono12", "Medium 10x20", &fonts::lgfxJapanGothic_20, 10, 20, 22, 22, 15, 26},
+    {"mono18", "Large 14x28", &fonts::lgfxJapanGothic_28, 14, 28, 30, 30, 23, 38},
+    {"mono24", "X-Large 18x36", &fonts::lgfxJapanGothic_36, 18, 36, 38, 38, 30, 50},
 };
 
 const TerminalFontOption& terminalFont()
@@ -495,10 +579,20 @@ uint8_t terminalLineStep()
     return step;
 }
 
+float uiScale()
+{
+    return config.ui.scale / 100.0f;
+}
+
+int uiTextH()
+{
+    return static_cast<int>(16 * uiScale() + 0.5f);
+}
+
 void setUiFont()
 {
     screenSprite.setFont(&fonts::AsciiFont8x16);
-    screenSprite.setTextSize(1);
+    screenSprite.setTextSize(uiScale());
 }
 
 void setTerminalFont()
@@ -569,12 +663,13 @@ uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 
 uint16_t terminalColor(uint32_t color, bool bold)
 {
-    static const uint16_t normal[] = {
-        TFT_BLACK, TFT_MAROON, TFT_DARKGREEN, TFT_OLIVE,
-        TFT_NAVY, TFT_PURPLE, TFT_DARKCYAN, TFT_LIGHTGREY,
-        TFT_DARKGREY, TFT_RED, TFT_GREEN, TFT_YELLOW,
-        TFT_BLUE, TFT_MAGENTA, TFT_CYAN, TFT_WHITE
-    };
+    const uint16_t* normal = ui.ansi;
+    if (color == kDefaultFgColor) {
+        return ui.fg;
+    }
+    if (color == kDefaultBgColor) {
+        return ui.bg;
+    }
     if (color & 0x01000000UL) {
         return static_cast<uint16_t>(color & 0xFFFF);
     }
@@ -637,27 +732,33 @@ void setSettingsFontForLine(const String& line = "")
         }
     }
     screenSprite.setFont(&fonts::AsciiFont8x16);
-    screenSprite.setTextSize(1);
+    screenSprite.setTextSize(uiScale());
 }
 
 int settingRowH()
 {
-    return max<int>(44, terminalFont().settingsLineHeight + 12);
+    return max<int>(44, uiTextH() + 18);
 }
 
 int settingListTop()
 {
-    if (screen == Screen::WifiEdit || screen == Screen::SshEdit || screen == Screen::ConfigEdit) {
+    if (screen == Screen::WifiEdit || screen == Screen::SshEdit || screen == Screen::ConfigEdit ||
+        screen == Screen::WgEdit || screen == Screen::SnipEdit) {
         return HeaderH + 38;
     }
-    return BodyBtn1.y + BodyBtn1.h + 18;
+    int infoH = 0;
+    const int gap = max(24, uiTextH() + 8);
+    if (screen == Screen::BtPage) infoH = 3 * gap + 12;
+    else if (screen == Screen::WgPage) infoH = 4 * gap + 16;
+    else if (screen == Screen::SshKeys) infoH = 3 * gap + 16;
+    return bodyBtn(0).y + bodyBtn(0).h + 14 + infoH;
 }
 
 void drawSettingsTitle(const char* title)
 {
     setSettingsFontForLine();
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
-    screenSprite.drawString(title, 8, HeaderH + 8);
+    screenSprite.setTextColor(ui.fg, ui.bg);
+    screenSprite.drawString(title, navW + 8, HeaderH + 8);
 }
 
 uint8_t utf8CharLength(uint8_t c)
@@ -1247,9 +1348,41 @@ bool drawFallbackUnicodeGlyph(uint32_t cp, int x, int y, int w, int h, uint16_t 
     return true;
 }
 
+bool containsNoCase(const String& text, const char* needle)
+{
+    String lower = text;
+    lower.toLowerCase();
+    return lower.indexOf(needle) >= 0;
+}
+
+// Local terminal lines: "[sys]" status messages, echoed "[tab5] command" lines and plain output.
 void drawMixedTerminalLine(const String& line, int x, int lineTop, int lineHeight)
 {
-    drawTerminalText(line, x, lineTop, lineHeight, TFT_GREEN, TFT_BLACK);
+    if (line.startsWith("[sys] ")) {
+        int cx = x + drawTerminalText("[sys] ", x, lineTop, lineHeight, ui.dim, ui.bg);
+        String rest = line.substring(6);
+        while (rest.startsWith("[")) {
+            const int close = rest.indexOf("] ");
+            if (close < 0) break;
+            cx += drawTerminalText(rest.substring(0, close + 2), cx, lineTop, lineHeight, ui.ansi[12], ui.bg);
+            rest = rest.substring(close + 2);
+        }
+        uint16_t color = ui.fg;
+        if (containsNoCase(rest, "fail") || containsNoCase(rest, "error") || containsNoCase(rest, "denied") ||
+            rest.startsWith("ERR")) {
+            color = ui.ansi[9];
+        } else if (containsNoCase(rest, "warn") || containsNoCase(rest, "retry")) {
+            color = ui.ansi[11];
+        }
+        drawTerminalText(rest, cx, lineTop, lineHeight, color, ui.bg);
+        return;
+    }
+    if (line.startsWith(LocalPrompt)) {
+        const int px = drawTerminalText(LocalPrompt, x, lineTop, lineHeight, ui.ansi[10], ui.bg);
+        drawTerminalText(line.substring(strlen(LocalPrompt)), x + px, lineTop, lineHeight, ui.fg, ui.bg);
+        return;
+    }
+    drawTerminalText(line, x, lineTop, lineHeight, ui.fg, ui.bg);
 }
 
 void drawVtTerminal()
@@ -1258,7 +1391,7 @@ void drawVtTerminal()
     static size_t lastScrollbackOffset = 0;
     const int cellW = terminalCellWidth();
     const int lineStep = terminalLineStep();
-    const int gridRight = 4 + static_cast<int>(vt.columns()) * cellW;
+    const int gridRight = navW + 4 + static_cast<int>(vt.columns()) * cellW;
     const int gridBottom = HeaderH + static_cast<int>(vt.rows()) * lineStep;
     const bool viewingHistory = vt.scrollbackOffset() > 0;
     int scrollDelta = 0;
@@ -1274,15 +1407,15 @@ void drawVtTerminal()
 
     if (gridRight < screenSprite.width()) {
         screenSprite.fillRect(gridRight, HeaderH, screenSprite.width() - gridRight,
-                              max<int>(0, min<int>(screenSprite.height(), gridBottom) - HeaderH), TFT_BLACK);
+                              max<int>(0, min<int>(screenSprite.height(), gridBottom) - HeaderH), ui.bg);
     }
     if (gridBottom < screenSprite.height()) {
-        screenSprite.fillRect(0, gridBottom, screenSprite.width(), screenSprite.height() - gridBottom, TFT_BLACK);
+        screenSprite.fillRect(navW, gridBottom, screenSprite.width() - navW, screenSprite.height() - gridBottom, ui.bg);
     }
 
     if (canShiftRows) {
         const int bodyH = max<int>(0, min<int>(screenSprite.height(), gridBottom) - HeaderH);
-        screenSprite.setClipRect(0, HeaderH, screenSprite.width(), bodyH);
+        screenSprite.setClipRect(navW, HeaderH, screenSprite.width() - navW, bodyH);
         screenSprite.scroll(0, scrollDelta * lineStep);
         screenSprite.clearClipRect();
     }
@@ -1293,7 +1426,7 @@ void drawVtTerminal()
             return;
         }
         for (size_t col = 0; col < vt.columns();) {
-            int x = 4 + static_cast<int>(col) * cellW;
+            int x = navW + 4 + static_cast<int>(col) * cellW;
             if (x >= screenSprite.width()) {
                 break;
             }
@@ -1395,7 +1528,7 @@ void drawVtTerminal()
         }
     }
     setTerminalFont();
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
+    screenSprite.setTextColor(ui.ansi[10], ui.bg);
     vt.clearDirty();
     lastViewingHistory = viewingHistory;
     lastScrollbackOffset = vt.scrollbackOffset();
@@ -1408,7 +1541,6 @@ void resetCommandEditor()
     commandHistoryIndex = commandHistory.size();
     remoteLineMode = false;
     cursorVisible = true;
-    lastCursorBlink = millis();
 }
 
 void clampCommandCursor()
@@ -1426,7 +1558,6 @@ void insertCommandText(const String& text)
     commandLine = commandLine.substring(0, commandCursor) + text + commandLine.substring(commandCursor);
     commandCursor += text.length();
     cursorVisible = true;
-    lastCursorBlink = millis();
     dirty = true;
 }
 
@@ -1442,7 +1573,6 @@ void backspaceCommandText()
     commandLine = commandLine.substring(0, pos) + commandLine.substring(commandCursor);
     commandCursor = pos;
     cursorVisible = true;
-    lastCursorBlink = millis();
     dirty = true;
 }
 
@@ -1461,7 +1591,6 @@ void moveCommandCursor(int delta)
         clampCommandCursor();
     }
     cursorVisible = true;
-    lastCursorBlink = millis();
     dirty = true;
 }
 
@@ -1488,7 +1617,6 @@ void browseCommandHistory(int delta)
     }
     commandCursor = commandLine.length();
     cursorVisible = true;
-    lastCursorBlink = millis();
     dirty = true;
 }
 
@@ -1528,6 +1656,12 @@ void appendCliHelp()
     appendCliLine("  help, man <command>, clear, status, history");
     appendCliLine("  uname, whoami, hostname, date, uptime, echo");
     appendCliLine("  wifi status, wifi list, wifi off, wifi on, ip addr");
+    appendCliLine("  wg status, wg on, wg off, wg reset, wg set <field> <value>");
+    appendCliLine("  wg import <sd-path>, wg remote [stop]");
+    appendCliLine("  sshkey list|gen [name]|pub <name>|rm <name>|import <sd-path> [name]|use <name> [profile]");
+    appendCliLine("  theme [list|<id>]");
+    appendCliLine("  sshhost [list|forget <host[:port]>]   (host keys are trusted on first use)");
+    appendCliLine("  snip [list|add <name> <cmd>|run <n>|rm <n>]");
     appendCliLine("  ssh list, ssh connect <index>, ssh disconnect");
     appendCliLine("  ssh user@host[:port] [password]");
     appendCliLine("  sd status, df, ls [-lah] [path], cat <path>, chmod <mode> <path>");
@@ -1697,7 +1831,7 @@ bool appendCliMan(const String& topic)
         appendCliLine("Examples:");
         appendCliLine("  python");
         appendCliLine("  python test.py 50");
-        appendCliLine("  python /scripts/blink.py");
+        appendCliLine("  python /scripts/example.py");
         appendCliLine("  python -c print('hello')");
         return true;
     }
@@ -2501,7 +2635,6 @@ bool completeSdPathAtCursor()
         commandCursor = start + replacement.length();
     }
     cursorVisible = true;
-    lastCursorBlink = millis();
     dirty = true;
     return true;
 }
@@ -2965,6 +3098,64 @@ void pollTimeSync()
     }
 }
 
+String runWireGuardCommand(const String& command)
+{
+    String lower = command;
+    lower.toLowerCase();
+    if (lower.startsWith("wg import") || lower.startsWith("wg remote")) {
+        return runExtraCommand(command);
+    }
+    if (lower == "wg status") {
+        return String("WireGuard ") + wireguard.status(config.wireguard) +
+               " address=" + config.wireguard.address +
+               " endpoint=" + config.wireguard.endpoint + ":" + config.wireguard.port +
+               " keys=" + (config.wireguard.privateKey.length() && config.wireguard.publicKey.length() ? "set" : "missing");
+    }
+    if (lower == "wg off") {
+        config.wireguard.enabled = false;
+        wireguard.stop();
+        return saveConfig() ? "WireGuard off" : "ERR saving WireGuard settings";
+    }
+    if (lower == "wg reset") {
+        wireguard.stop();
+        config.wireguard = WireGuardConfig{};
+        return saveConfig() ? "WireGuard configuration cleared" : "ERR saving WireGuard settings";
+    }
+    if (lower == "wg on") {
+        String error;
+        if (!WireGuardRuntime::validate(config.wireguard, error)) return String("ERR ") + error;
+        config.wireguard.enabled = true;
+        if (!saveConfig()) return "ERR saving WireGuard settings";
+        wireguard.poll(config.wireguard);
+        return String("WireGuard ") + wireguard.status(config.wireguard);
+    }
+    if (lower.startsWith("wg set ")) {
+        String args = command.substring(7);
+        const int split = args.indexOf(' ');
+        if (split <= 0) return "ERR usage: wg set <address|private-key|endpoint|port|public-key> <value>";
+        String field = args.substring(0, split);
+        field.toLowerCase();
+        String value = args.substring(split + 1);
+        value.trim();
+        if (!value.length()) return "ERR empty value";
+        WireGuardConfig next = config.wireguard;
+        if (field == "address") next.address = value;
+        else if (field == "private-key") next.privateKey = value;
+        else if (field == "endpoint") next.endpoint = value;
+        else if (field == "public-key") next.publicKey = value;
+        else if (field == "port") {
+            char* end = nullptr;
+            const long port = strtol(value.c_str(), &end, 10);
+            if (*end || port < 1 || port > 65535) return "ERR port must be 1..65535";
+            next.port = static_cast<uint16_t>(port);
+        } else return "ERR unknown WireGuard field";
+        wireguard.stop();
+        config.wireguard = next;
+        return saveConfig() ? String("WireGuard ") + field + " saved" : "ERR saving WireGuard settings";
+    }
+    return "ERR usage: wg status|on|off|reset|set <field> <value>";
+}
+
 bool handleTab5CliCommand(const String& line)
 {
     String command = line;
@@ -3048,6 +3239,15 @@ bool handleTab5CliCommand(const String& line)
         return true;
     }
     if (handleBleCliCommand(command, lower)) {
+        return true;
+    }
+    if (lower == "wg" || lower.startsWith("wg ")) {
+        appendCliLine(runWireGuardCommand(command));
+        return true;
+    }
+    if (lower == "sshkey" || lower.startsWith("sshkey ") || lower == "theme" || lower.startsWith("theme ") ||
+        lower == "sshhost" || lower.startsWith("sshhost ") || lower == "snip" || lower.startsWith("snip ")) {
+        appendCliLine(runExtraCommand(command));
         return true;
     }
     if (lower == "wifi status") {
@@ -3213,12 +3413,12 @@ void trackRemoteCommandText(const String& text)
 
 int settingTextY(int rowY)
 {
-    return rowY + max<int>(6, (settingRowH() - terminalFont().settingsLineHeight) / 2);
+    return rowY + max<int>(4, (settingRowH() - 2 - uiTextH()) / 2);
 }
 
 size_t visibleSettingRows()
 {
-    const int available = max<int>(1, screenSprite.height() - settingListTop());
+    const int available = max<int>(1, screenSprite.height() - settingListTop() - 30);
     return max<size_t>(1, available / settingRowH());
 }
 
@@ -3247,21 +3447,38 @@ void scrollSettingList(int delta, size_t total)
     dirty = true;
 }
 
-void drawButton(const Rect& r, const char* label, uint16_t fg = TFT_WHITE, uint16_t bg = TFT_DARKGREY)
+enum class Btn : uint8_t { Normal, Primary, Danger, Active };
+
+// Professional style: outlined buttons, one filled primary, destructive actions in red text.
+void drawButton(const Rect& r, const char* label, Btn kind = Btn::Normal, bool focused = false)
 {
-    screenSprite.fillRect(r.x, r.y, r.w, r.h, bg);
-    screenSprite.drawRect(r.x, r.y, r.w, r.h, TFT_LIGHTGREY);
-    screenSprite.setTextColor(fg, bg);
-    int textY = r.y + max<int>(2, (r.h - screenSprite.fontHeight()) / 2);
-    screenSprite.drawString(label, r.x + 6, textY);
+    uint16_t fill = ui.bg;
+    uint16_t border = ui.border;
+    uint16_t text = ui.fg;
+    switch (kind) {
+    case Btn::Primary: fill = ui.accent; border = ui.accent; text = ui.onAccent; break;
+    case Btn::Danger: text = ui.red; border = ui.dangerLine; break;
+    case Btn::Active: fill = ui.sel; border = ui.accent; break;
+    case Btn::Normal: break;
+    }
+    if (focused) {
+        border = ui.accent;
+    }
+    screenSprite.fillRoundRect(r.x, r.y, r.w, r.h, 4, fill);
+    screenSprite.drawRoundRect(r.x, r.y, r.w, r.h, 4, border);
+    screenSprite.setTextColor(text, fill);
+    const int textW = screenSprite.textWidth(label);
+    const int textX = r.x + max<int>(4, (r.w - textW) / 2);
+    const int textY = r.y + max<int>(2, (r.h - screenSprite.fontHeight()) / 2);
+    screenSprite.drawString(label, textX, textY);
 }
 
-void drawFocusedBodyButton(const Rect& r, const char* label, size_t focusIndex, uint16_t bg = TFT_DARKGREY)
+void drawFocusedBodyButton(const Rect& r, const char* label, size_t focusIndex, Btn kind = Btn::Normal)
 {
     bool focused = !keyboardMenuMode && focusedContentItem == focusIndex;
-    drawButton(r, label, TFT_WHITE, focused ? TFT_NAVY : bg);
+    drawButton(r, label, kind, focused);
     if (focused) {
-        screenSprite.drawRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4, TFT_CYAN);
+        screenSprite.drawRoundRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4, 5, ui.accent);
     }
 }
 
@@ -3275,34 +3492,83 @@ void drawHeaderFocus()
     if (!r) {
         return;
     }
-    screenSprite.drawRect(r->x - 2, r->y - 2, r->w + 4, r->h + 4, TFT_YELLOW);
-    screenSprite.drawRect(r->x - 3, r->y - 3, r->w + 6, r->h + 6, TFT_YELLOW);
+    screenSprite.drawRect(r->x - 2, r->y - 2, r->w + 4, r->h + 4, ui.warn);
+    screenSprite.drawRect(r->x - 3, r->y - 3, r->w + 6, r->h + 6, ui.warn);
+}
+
+int activeTabIndex()
+{
+    switch (screen) {
+    case Screen::Terminal: return 0;
+    case Screen::WifiList:
+    case Screen::WifiEdit:
+    case Screen::WifiScan: return 1;
+    case Screen::BtPage: return 2;
+    case Screen::WgPage:
+    case Screen::WgEdit: return 3;
+    case Screen::SshList:
+    case Screen::SshEdit:
+    case Screen::SshKeys:
+    case Screen::SnipList:
+    case Screen::SnipEdit: return 4;
+    case Screen::ThemeList: return 5;
+    case Screen::ConfigEdit: return 6;
+    }
+    return 0;
+}
+
+void drawTab(int index, const char* label)
+{
+    const Rect r = tabRect(index);
+    const bool on = index == activeTabIndex();
+    if (navW) {
+        const uint16_t bg = on ? ui.sel : ui.chrome;
+        screenSprite.fillRect(r.x, r.y, r.w, r.h, bg);
+        if (on) {
+            screenSprite.fillRect(r.x, r.y, 4, r.h, ui.accent);
+        }
+        screenSprite.setTextColor(on ? ui.fg : ui.dim, bg);
+        screenSprite.drawString(label, r.x + 16, r.y + (r.h - screenSprite.fontHeight()) / 2);
+    } else {
+        screenSprite.setTextColor(on ? ui.fg : ui.dim, ui.chrome);
+        screenSprite.drawString(label, r.x + (r.w - screenSprite.textWidth(label)) / 2,
+                                r.y + (r.h - screenSprite.fontHeight()) / 2 - 1);
+        if (on) {
+            screenSprite.fillRect(r.x, HeaderH - 4, r.w, 3, ui.accent);
+        }
+    }
 }
 
 void drawHeader()
 {
-    screenSprite.fillRect(0, 0, screenSprite.width(), HeaderH, TFT_DARKGREY);
     setUiFont();
-    drawButton(BtnTerminal, "TERM");
-    drawButton(BtnWifi, "WIFI");
-    drawButton(BtnSsh, "SSH");
-    drawButton(BtnFont, "FONT");
-    drawButton(BtnConfig, "CONF");
-
-    if (screen == Screen::Terminal) {
-        drawButton(BtnConnect, ssh.connected() ? "DISC" : "CONN", TFT_WHITE, ssh.connected() ? TFT_MAROON : TFT_DARKGREEN);
-    } else if (screen == Screen::WifiEdit) {
-        drawButton(BtnConnect, "CONN", TFT_WHITE, TFT_DARKGREEN);
-        drawButton(BtnSave, "SAVE", TFT_WHITE, TFT_DARKGREEN);
-        drawButton(BtnDelete, "DEL", TFT_WHITE, TFT_MAROON);
-    } else if (screen == Screen::SshEdit) {
-        drawButton(BtnSave, "SAVE", TFT_WHITE, TFT_DARKGREEN);
-        drawButton(BtnDelete, "DEL", TFT_WHITE, TFT_MAROON);
-    } else if (screen == Screen::ConfigEdit) {
-        drawButton(BtnSave, "SAVE", TFT_WHITE, TFT_DARKGREEN);
+    const int sw = screenSprite.width();
+    if (navW) {
+        screenSprite.fillRect(0, 0, navW, screenSprite.height(), ui.chrome);
+        screenSprite.drawFastVLine(navW - 1, 0, screenSprite.height(), ui.border);
+    }
+    screenSprite.fillRect(navW, 0, sw - navW, HeaderH, ui.chrome);
+    screenSprite.drawFastHLine(navW, HeaderH - 1, sw - navW, ui.border);
+    static const char* const labels[TabCount] = {"TERM", "WIFI", "BT", "WG", "SSH", "THEME", "CONF"};
+    for (int i = 0; i < TabCount; ++i) {
+        drawTab(i, labels[i]);
     }
 
-    screenSprite.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    if (screen == Screen::Terminal) {
+        const bool up = ssh.connected();
+        drawButton(ctxBtn(0), up ? "DISC" : "CONN", up ? Btn::Danger : Btn::Primary);
+    } else if (screen == Screen::WifiEdit) {
+        drawButton(ctxBtn(0), "CONN");
+        drawButton(ctxBtn(1), "SAVE", Btn::Primary);
+        drawButton(ctxBtn(2), "DEL", Btn::Danger);
+    } else if (screen == Screen::SshEdit) {
+        drawButton(ctxBtn(1), "SAVE", Btn::Primary);
+        drawButton(ctxBtn(2), "DEL", Btn::Danger);
+    } else if (screen == Screen::ConfigEdit || screen == Screen::WgEdit || screen == Screen::SnipEdit) {
+        drawButton(ctxBtn(1), "SAVE", Btn::Primary);
+    }
+
+    screenSprite.setTextColor(ui.dim, ui.chrome);
     String wifiStateText = "WiFi down";
     if (wifiDisabled) {
         wifiStateText = "WiFi off";
@@ -3313,26 +3579,36 @@ void drawHeader()
     } else if (wifiState == WifiConnectState::Failed && wifiRetryAt) {
         wifiStateText = "WiFi retry";
     }
-    String status = wifiStateText + (ssh.connected() ? "  SSH ok" : "  SSH down");
-    if (screen == Screen::FontList) {
-        status = String("Font: ") + terminalFont().label + " line " + terminalLineStep();
+    String status = wifiStateText;
+    if (config.wireguard.enabled) {
+        status += wireguard.active() ? (wireguard.handshakeUp() ? "  WG up" : "  WG wait") : "  WG down";
+    }
+    status += ssh.connected() ? "  SSH ok" : "  SSH down";
+    if (screen == Screen::ThemeList) {
+        status = String(themeCurrent().name) + " / " + terminalFont().label;
     } else if (screen == Screen::ConfigEdit) {
         status = String(config.system.deviceName) + " " + config.system.region;
     } else if (screen == Screen::Terminal && ssh.connected() && vt.scrollbackOffset() > 0) {
         status = String("Scroll +") + vt.scrollbackOffset();
     }
-    if (status.length() > 42) {
-        status = status.substring(0, 42);
+    const size_t maxStatus = static_cast<size_t>(42 / uiScale());
+    if (status.length() > maxStatus) {
+        status = status.substring(0, maxStatus);
     }
-    int statusX = screenSprite.width() - screenSprite.textWidth(status) - 8;
-    statusX = max<int>(540, statusX);
-    screenSprite.drawString(status, statusX, 14);
+    int statusX = sw - screenSprite.textWidth(status) - 12;
+    statusX = max<int>(navW ? navW + 270 : 830, statusX);
+    screenSprite.drawString(status, statusX, (HeaderH - 1 - uiTextH()) / 2);
     drawHeaderFocus();
+}
+
+void applyNav()
+{
+    navW = config.ui.nav == "side" ? RailW : 0;
 }
 
 void configureTerminal()
 {
-    const size_t columns = max<int>(20, (screenSprite.width() - 8) / terminalCellWidth());
+    const size_t columns = max<int>(20, (screenSprite.width() - navW - 8) / terminalCellWidth());
     size_t rows = max<int>(5, (screenSprite.height() - HeaderH - 4) / terminalLineStep());
     terminal.setViewport(columns, rows);
     vt.resize(columns, rows);
@@ -3343,7 +3619,7 @@ void configureTerminal()
 
 void appendStatus(const String& message)
 {
-    terminal.append("[tab5] ");
+    terminal.append("[sys] ");
     terminal.append(message);
     terminal.append("\n");
     Serial.print("[tab5] ");
@@ -3352,14 +3628,23 @@ void appendStatus(const String& message)
     dirty = true;
 }
 
+void scheduleSave()
+{
+    saveDueAt = millis() + 1200;
+    if (!saveDueAt) saveDueAt = 1;
+}
+
 bool saveConfig()
 {
+    saveDueAt = 0;
+    const uint32_t saveStart = millis();
     config.activeWifi = activeWifi;
     config.activeSsh = activeSsh;
     if (!settings.save(config)) {
         appendStatus(String("Save failed: ") + settings.lastError());
         return false;
     }
+    Serial.printf("config save took %lu ms\n", static_cast<unsigned long>(millis() - saveStart));
     appendStatus("Profiles saved");
     return true;
 }
@@ -3405,10 +3690,10 @@ void setWifiFailureStatus(const String& prefix)
 
 void stopWifiRuntime()
 {
+    wireguard.stop();
     wifiDisabled = true;
     wifiState = WifiConnectState::Idle;
     wifiRetryAt = 0;
-    wifiLastRetrySecond = -1;
     wifiDirectBeginPending = false;
     wifiWorkerDone = false;
     wifiWorkerSsid = "";
@@ -3544,7 +3829,6 @@ void adjustTerminalLineStep(int delta)
 
 void beginWifiAttempt(size_t index)
 {
-    wifiLastRetrySecond = -1;
     if (wifiDisabled) {
         wifiState = WifiConnectState::Idle;
         wifiRetryAt = 0;
@@ -3580,7 +3864,6 @@ void beginWifiAttempt(size_t index)
 void startWifiReconnect(uint32_t timeoutMs)
 {
     wifiAttemptTimeoutMs = timeoutMs;
-    wifiLastRetrySecond = -1;
     if (wifiDisabled) {
         wifiState = WifiConnectState::Idle;
         wifiRetryAt = 0;
@@ -3629,7 +3912,8 @@ void pollWifi()
         }
         if (WiFi.status() == WL_CONNECTED) {
             wifiState = WifiConnectState::Connected;
-            setWifiStatus(String("Wi-Fi connected: ") + WiFi.SSID() + " " + WiFi.localIP().toString());
+            connectedSsidCache = WiFi.SSID();
+            setWifiStatus(String("Wi-Fi connected: ") + connectedSsidCache + " " + WiFi.localIP().toString());
             appendWifiProgress(wifiStatusText);
             startTimeSync(false);
             return;
@@ -3666,16 +3950,7 @@ void pollWifi()
         uint32_t now = millis();
         if (now >= wifiRetryAt) {
             wifiRetryAt = 0;
-            wifiLastRetrySecond = -1;
             startWifiReconnect(wifiAttemptTimeoutMs);
-        } else {
-            int16_t remaining = static_cast<int16_t>((wifiRetryAt - now + 999) / 1000);
-            if (remaining != wifiLastRetrySecond) {
-                wifiLastRetrySecond = remaining;
-                String reason = wifiLastFailureText.length() ? wifiLastFailureText : String("WiFi fail ") + wifiDisconnectSummary();
-                setWifiStatus(reason + String("; retry ") + remaining + "s");
-                appendWifiProgress(reason + String("; retry ") + remaining + "s");
-            }
         }
     }
 }
@@ -3693,6 +3968,7 @@ void connectActiveSsh()
     String err;
     screen = Screen::Terminal;
     dirty = true;
+    currentSshHost = config.ssh[activeSsh].host;
     appendStatus(String("Connecting SSH: ") + config.ssh[activeSsh].host);
     draw();
     setCrashStage("ssh.connect");
@@ -3716,6 +3992,7 @@ bool connectSshProfile(const SshProfile& profile)
     String err;
     screen = Screen::Terminal;
     dirty = true;
+    currentSshHost = profile.host;
     appendStatus(String("Connecting SSH: ") + profile.user + "@" + profile.host);
     draw();
     setCrashStage("ssh.connect.direct");
@@ -3739,6 +4016,8 @@ void inheritSavedSshCredentials(SshProfile& profile)
     for (const auto& saved : config.ssh) {
         if (saved.host == profile.host && saved.user == profile.user && saved.port == profile.port) {
             profile.password = saved.password;
+            profile.keyName = saved.keyName;
+            profile.keyPassphrase = saved.keyPassphrase;
             profile.terminal = saved.terminal.length() ? saved.terminal : "xterm-256color";
             return;
         }
@@ -3746,6 +4025,8 @@ void inheritSavedSshCredentials(SshProfile& profile)
     for (const auto& saved : config.ssh) {
         if (saved.host == profile.host && saved.user == profile.user) {
             profile.password = saved.password;
+            profile.keyName = saved.keyName;
+            profile.keyPassphrase = saved.keyPassphrase;
             profile.terminal = saved.terminal.length() ? saved.terminal : "xterm-256color";
             return;
         }
@@ -3835,6 +4116,89 @@ String safeValue(const String& value, bool secret = false)
     return masked;
 }
 
+enum class Choices : uint8_t { None, Ssid, Port, Term, SshKey, Region, Utc, Ntp, Keymap, OnOff, Nav, BootMode };
+
+struct FieldSpec {
+    const char* label;
+    Choices choices;
+    bool strict;  // value must come from the list (no free typing)
+    bool secret;
+    bool numeric;
+};
+
+constexpr FieldSpec kWifiFields[] = {
+    {"Name", Choices::None, false, false, false},
+    {"SSID", Choices::Ssid, false, false, false},
+    {"Password", Choices::None, false, true, false},
+};
+constexpr FieldSpec kSshFields[] = {
+    {"Name", Choices::None, false, false, false},
+    {"Host", Choices::None, false, false, false},
+    {"Port", Choices::Port, false, false, true},
+    {"User", Choices::None, false, false, false},
+    {"Password", Choices::None, false, true, false},
+    {"Terminal", Choices::Term, false, false, false},
+    {"SSH key", Choices::SshKey, true, false, false},
+    {"Key pass", Choices::None, false, true, false},
+};
+constexpr FieldSpec kConfigFields[] = {
+    {"Device", Choices::None, false, false, false},
+    {"Region", Choices::Region, false, false, false},
+    {"UTC min", Choices::Utc, false, false, true},
+    {"NTP", Choices::Ntp, false, false, false},
+    {"Keymap", Choices::Keymap, true, false, false},
+    {"Swap Ctrl/Caps", Choices::OnOff, true, false, false},
+    {"Navigation", Choices::Nav, true, false, false},
+    {"Log sessions", Choices::OnOff, true, false, false},
+    {"WG at boot", Choices::BootMode, true, false, false},
+};
+constexpr FieldSpec kWgFields[] = {
+    {"Address", Choices::None, false, false, false},
+    {"Private key", Choices::None, false, true, false},
+    {"Endpoint", Choices::None, false, false, false},
+    {"Port", Choices::None, false, false, true},
+    {"Peer pub key", Choices::None, false, false, false},
+    {"Preshared", Choices::None, false, true, false},
+    {"Keepalive s", Choices::None, false, false, true},
+};
+
+constexpr FieldSpec kSnipFields[] = {
+    {"Name", Choices::None, false, false, false},
+    {"Command", Choices::None, false, false, false},
+};
+
+const FieldSpec* fieldSpecs(size_t& count)
+{
+    switch (screen) {
+    case Screen::WifiEdit: count = sizeof(kWifiFields) / sizeof(kWifiFields[0]); return kWifiFields;
+    case Screen::SshEdit: count = sizeof(kSshFields) / sizeof(kSshFields[0]); return kSshFields;
+    case Screen::ConfigEdit: count = sizeof(kConfigFields) / sizeof(kConfigFields[0]); return kConfigFields;
+    case Screen::WgEdit: count = sizeof(kWgFields) / sizeof(kWgFields[0]); return kWgFields;
+    case Screen::SnipEdit: count = sizeof(kSnipFields) / sizeof(kSnipFields[0]); return kSnipFields;
+    default: count = 0; return nullptr;
+    }
+}
+
+bool isEditScreen()
+{
+    return screen == Screen::WifiEdit || screen == Screen::SshEdit || screen == Screen::ConfigEdit ||
+           screen == Screen::WgEdit || screen == Screen::SnipEdit;
+}
+
+uint8_t editFieldCount()
+{
+    size_t count = 0;
+    fieldSpecs(count);
+    return static_cast<uint8_t>(count);
+}
+
+const FieldSpec* fieldSpecAt(uint8_t field)
+{
+    size_t count = 0;
+    const FieldSpec* specs = fieldSpecs(count);
+    return specs && field < count ? &specs[field] : nullptr;
+}
+
 String wifiFieldValue(uint8_t field)
 {
     if (editIndex >= config.wifi.size()) {
@@ -3868,7 +4232,9 @@ String sshFieldValue(uint8_t field)
     if (field == 2) return String(p.port);
     if (field == 3) return p.user;
     if (field == 4) return p.password;
-    return p.terminal;
+    if (field == 5) return p.terminal;
+    if (field == 6) return p.keyName.length() ? p.keyName : String("(none)");
+    return p.keyPassphrase;
 }
 
 void setSshFieldValue(uint8_t field, const String& value)
@@ -3883,6 +4249,8 @@ void setSshFieldValue(uint8_t field, const String& value)
     if (field == 3) p.user = value;
     if (field == 4) p.password = value;
     if (field == 5) p.terminal = value.length() ? value : "xterm-256color";
+    if (field == 6) p.keyName = value == "(none)" ? String("") : value;
+    if (field == 7) p.keyPassphrase = value;
 }
 
 String configFieldValue(uint8_t field)
@@ -3892,16 +4260,11 @@ String configFieldValue(uint8_t field)
     if (field == 2) return String(config.system.utcOffsetMinutes);
     if (field == 3) return config.system.ntpServer;
     if (field == 4) return config.keyboard.layout;
-    if (field == 5) return config.keyboard.bleKeyboardEnabled ? "on" : "off";
-    if (field == 6) return config.keyboard.bleKeyboardName;
-    if (field == 7) return config.keyboard.bleKeyboardAddress;
-    if (field == 8) {
-        String entry = keyboard.bleScanEntry(blePairTarget);
-        return entry.length() ? entry : String(blePairTarget);
-    }
-    if (field == 9) return "scan now";
-    if (field == 10) return "pair selected";
-    return "forget paired";
+    if (field == 5) return config.keyboard.swapCtrlCaps ? "on" : "off";
+    if (field == 6) return config.ui.nav;
+    if (field == 7) return config.system.logSessions ? "on" : "off";
+    if (field == 8) return config.wireguard.autoStart ? "always on" : "off";
+    return "";
 }
 
 void setConfigFieldValue(uint8_t field, const String& value)
@@ -3918,19 +4281,59 @@ void setConfigFieldValue(uint8_t field, const String& value)
     if (field == 5) {
         String enabled = value;
         enabled.toLowerCase();
-        config.keyboard.bleKeyboardEnabled = enabled == "on" || enabled == "1" || enabled == "yes" || enabled == "true";
+        config.keyboard.swapCtrlCaps = enabled == "on" || enabled == "1" || enabled == "yes" || enabled == "true";
     }
-    if (field == 6) config.keyboard.bleKeyboardName = value;
-    if (field == 7) config.keyboard.bleKeyboardAddress = value;
-    if (field == 8) blePairTarget = static_cast<size_t>(max<int>(0, value.toInt()));
+    if (field == 6) {
+        config.ui.nav = value == "side" ? "side" : "top";
+        applyNav();
+        configureTerminal();
+        vt.markAllDirty();
+        lastDrawnTerminalGeneration = UINT32_MAX;
+    }
+    if (field == 7) {
+        config.system.logSessions = value == "on";
+    }
+    if (field == 8) {
+        config.wireguard.autoStart = value == "always on";
+    }
 }
 
-uint8_t editFieldCount()
+String wgFieldValue(uint8_t field)
 {
-    if (screen == Screen::WifiEdit) return 3;
-    if (screen == Screen::SshEdit) return 6;
-    if (screen == Screen::ConfigEdit) return 12;
-    return 0;
+    const auto& w = config.wireguard;
+    if (field == 0) return w.address;
+    if (field == 1) return w.privateKey;
+    if (field == 2) return w.endpoint;
+    if (field == 3) return String(w.port);
+    if (field == 4) return w.publicKey;
+    if (field == 5) return w.presharedKey;
+    return String(w.keepalive);
+}
+
+void setWgFieldValue(uint8_t field, const String& value)
+{
+    auto& w = config.wireguard;
+    String v = value;
+    v.trim();
+    if (field == 0) w.address = v;
+    if (field == 1) w.privateKey = v;
+    if (field == 2) w.endpoint = v;
+    if (field == 3) w.port = static_cast<uint16_t>(constrain(v.toInt(), 1, 65535));
+    if (field == 4) w.publicKey = v;
+    if (field == 5) w.presharedKey = v;
+    if (field == 6) w.keepalive = static_cast<uint16_t>(constrain(v.toInt(), 0, 65534));
+}
+
+String snipFieldValue(uint8_t field)
+{
+    if (editIndex >= config.snippets.size()) return "";
+    return field == 0 ? config.snippets[editIndex].name : config.snippets[editIndex].text;
+}
+
+void setSnipFieldValue(uint8_t field, const String& value)
+{
+    if (editIndex >= config.snippets.size()) return;
+    (field == 0 ? config.snippets[editIndex].name : config.snippets[editIndex].text) = value;
 }
 
 String currentEditFieldValue()
@@ -3938,6 +4341,8 @@ String currentEditFieldValue()
     if (screen == Screen::WifiEdit) return wifiFieldValue(editField);
     if (screen == Screen::SshEdit) return sshFieldValue(editField);
     if (screen == Screen::ConfigEdit) return configFieldValue(editField);
+    if (screen == Screen::WgEdit) return wgFieldValue(editField);
+    if (screen == Screen::SnipEdit) return snipFieldValue(editField);
     return "";
 }
 
@@ -3946,6 +4351,8 @@ void setCurrentEditFieldValue(const String& value)
     if (screen == Screen::WifiEdit) setWifiFieldValue(editField, value);
     if (screen == Screen::SshEdit) setSshFieldValue(editField, value);
     if (screen == Screen::ConfigEdit) setConfigFieldValue(editField, value);
+    if (screen == Screen::WgEdit) setWgFieldValue(editField, value);
+    if (screen == Screen::SnipEdit) setSnipFieldValue(editField, value);
 }
 
 void saveBlePairingFromKeyboard()
@@ -4025,61 +4432,213 @@ bool removeBleDeviceConfig(int index, String& result)
     return true;
 }
 
-void executeConfigBleAction(uint8_t field)
+struct ChoiceOption {
+    String label;
+    String value;
+    bool custom{false};
+};
+
+struct RegionEntry {
+    const char* name;
+    int16_t offsetMinutes; // standard time; the firmware does not apply DST
+};
+
+constexpr RegionEntry kRegions[] = {
+    {"Asia/Tokyo", 540},         {"Asia/Seoul", 540},        {"Asia/Shanghai", 480},
+    {"Asia/Singapore", 480},     {"Asia/Kolkata", 330},      {"Asia/Dubai", 240},
+    {"Europe/Moscow", 180},      {"Europe/Athens", 120},     {"Europe/Berlin", 60},
+    {"Europe/Paris", 60},        {"Europe/London", 0},       {"UTC", 0},
+    {"America/Sao_Paulo", -180}, {"America/New_York", -300}, {"America/Chicago", -360},
+    {"America/Denver", -420},    {"America/Los_Angeles", -480}, {"Pacific/Honolulu", -600},
+    {"Australia/Sydney", 600},   {"Pacific/Auckland", 720},
+};
+
+constexpr size_t kDropdownRows = 8;
+std::vector<ChoiceOption> dropdownOptions;
+bool dropdownOpen = false;
+size_t dropdownSel = 0;
+size_t dropdownTop = 0;
+
+String utcLabel(int minutes)
 {
-    if (field == 5) {
-        config.keyboard.bleKeyboardEnabled = !config.keyboard.bleKeyboardEnabled;
-        keyboard.configure(config.keyboard);
-        saveConfig();
-        appendStatus(String("BLE keyboard ") + (config.keyboard.bleKeyboardEnabled ? "enabled" : "disabled"));
-    } else if (field == 8) {
-        size_t count = keyboard.bleScanCount();
-        blePairTarget = count ? (blePairTarget + 1) % count : 0;
-        appendStatus(String("BLE target ") + blePairTarget);
-    } else if (field == 9) {
-        config.keyboard.bleKeyboardEnabled = true;
-        keyboard.configure(config.keyboard);
-        saveConfig();
-        String result;
-        bool ok = keyboard.bleScan(result);
-        blePairTarget = 0;
-        appendStatus(String(ok ? "BLE scan: " : "BLE scan failed: ") + result);
-    } else if (field == 10) {
-        String result;
-        bool ok = keyboard.blePair(blePairTarget, result);
-        if (ok) {
-            saveBlePairingFromKeyboard();
+    String label = "UTC";
+    if (minutes == 0) return label;
+    label += minutes < 0 ? "-" : "+";
+    const int a = abs(minutes);
+    label += String(a / 60);
+    if (a % 60) label += String(":") + (a % 60 < 10 ? "0" : "") + String(a % 60);
+    return label;
+}
+
+void buildChoiceOptions(const FieldSpec& spec)
+{
+    dropdownOptions.clear();
+    auto add = [](const String& label, const String& value) { dropdownOptions.push_back({label, value, false}); };
+    switch (spec.choices) {
+    case Choices::Ssid:
+        for (const auto& n : scannedNetworks) {
+            add(n.ssid + "  (" + n.rssi + " dBm" + (n.auth == WIFI_AUTH_OPEN ? ", open)" : ")"), n.ssid);
         }
-        appendStatus(String(ok ? "BLE pair: " : "BLE pair failed: ") + result);
-    } else if (field == 11) {
-        String result;
-        bool ok = keyboard.bleForget(result);
-        String configResult;
-        removeBleDeviceConfig(-1, configResult);
-        appendStatus(String(ok ? "BLE forget: " : "BLE forget failed: ") + result);
+        break;
+    case Choices::Port:
+        add("22 (SSH default)", "22");
+        add("2222", "2222");
+        add("22222", "22222");
+        break;
+    case Choices::Term:
+        for (const char* t : {"xterm-256color", "xterm", "screen-256color", "tmux-256color", "linux", "vt100", "ansi"}) {
+            add(t, t);
+        }
+        break;
+    case Choices::SshKey:
+        add("(none) - password login", "(none)");
+        for (const auto& name : SshKeys::list()) add(name, name);
+        break;
+    case Choices::Region:
+        for (const auto& r : kRegions) add(String(r.name) + "  " + utcLabel(r.offsetMinutes), r.name);
+        break;
+    case Choices::Utc:
+        for (int m : {-720, -600, -480, -420, -360, -300, -240, -180, 0, 60, 120, 180, 240, 330, 480, 540, 600, 720}) {
+            add(utcLabel(m) + "  (" + m + " min)", String(m));
+        }
+        break;
+    case Choices::Ntp:
+        for (const char* n : {"pool.ntp.org", "time.google.com", "time.cloudflare.com", "time.apple.com",
+                              "time.windows.com", "time.nist.gov", "ntp.nict.jp"}) {
+            add(n, n);
+        }
+        break;
+    case Choices::Keymap:
+        add("US layout", "us");
+        add("JP layout", "jp");
+        break;
+    case Choices::BootMode:
+        add("Off (default)", "off");
+        add("Always on", "always on");
+        break;
+    case Choices::Nav:
+        add("Top tab strip", "top");
+        add("Side rail", "side");
+        break;
+    case Choices::OnOff:
+        add("off", "off");
+        add("on", "on");
+        break;
+    case Choices::None:
+        break;
     }
-    editCursor = configFieldValue(editField).length();
+    if (!spec.strict) {
+        dropdownOptions.push_back({"Type a custom value...", "", true});
+    }
+}
+
+void dropdownKeepSelectionVisible()
+{
+    if (dropdownSel < dropdownTop) {
+        dropdownTop = dropdownSel;
+    } else if (dropdownSel >= dropdownTop + kDropdownRows) {
+        dropdownTop = dropdownSel - kDropdownRows + 1;
+    }
+}
+
+void closeDropdown()
+{
+    dropdownOpen = false;
+    dropdownOptions.clear();
     dirty = true;
+}
+
+void openDropdown()
+{
+    const FieldSpec* spec = fieldSpecAt(editField);
+    if (!spec || spec->choices == Choices::None) {
+        return;
+    }
+    buildChoiceOptions(*spec);
+    String current = currentEditFieldValue();
+    dropdownSel = 0;
+    for (size_t i = 0; i < dropdownOptions.size(); ++i) {
+        if (!dropdownOptions[i].custom && dropdownOptions[i].value == current) {
+            dropdownSel = i;
+            break;
+        }
+    }
+    dropdownTop = 0;
+    dropdownKeepSelectionVisible();
+    dropdownOpen = true;
+    dirty = true;
+}
+
+void dropdownMove(int delta)
+{
+    if (dropdownOptions.empty()) {
+        return;
+    }
+    int next = static_cast<int>(dropdownSel) + delta;
+    next = max(0, min(next, static_cast<int>(dropdownOptions.size()) - 1));
+    dropdownSel = static_cast<size_t>(next);
+    dropdownKeepSelectionVisible();
+    dirty = true;
+}
+
+void setEditCursorToEnd();
+
+void dropdownPick(size_t index)
+{
+    if (index >= dropdownOptions.size()) {
+        closeDropdown();
+        return;
+    }
+    const ChoiceOption option = dropdownOptions[index];
+    const FieldSpec* spec = fieldSpecAt(editField);
+    closeDropdown();
+    if (option.custom || !spec) {
+        setEditCursorToEnd();
+        return;
+    }
+    setCurrentEditFieldValue(option.value);
+    if (spec->choices == Choices::Region) {
+        for (const auto& r : kRegions) {
+            if (option.value == r.name) {
+                config.system.utcOffsetMinutes = r.offsetMinutes;
+                break;
+            }
+        }
+    } else if (spec->choices == Choices::Ssid && editIndex < config.wifi.size() &&
+               config.wifi[editIndex].name.startsWith("wifi-")) {
+        config.wifi[editIndex].name = option.value;
+    }
+    setEditCursorToEnd();
 }
 
 bool isChoiceEditField()
 {
-    return screen == Screen::ConfigEdit && (editField == 4 || editField == 5 || editField >= 8);
+    const FieldSpec* spec = fieldSpecAt(editField);
+    return spec && spec->strict;
 }
 
 void toggleChoiceEditField()
 {
-    if (!isChoiceEditField()) {
-        return;
+    openDropdown();
+}
+
+Rect dropdownArrowRect(int rowY)
+{
+    return Rect{screenSprite.width() - 64, rowY + 2, 56, settingRowH() - 8};
+}
+
+Rect dropdownRect()
+{
+    const int rowH = settingRowH();
+    const int rowY = settingListTop() + editField * rowH;
+    const int visible = static_cast<int>(min(kDropdownRows, dropdownOptions.size()));
+    const int h = visible * rowH + 4;
+    const int w = min<int>(560, screenSprite.width() - navW - 200);
+    int top = rowY + rowH;
+    if (top + h > screenSprite.height() - 8) {
+        top = rowY - h >= HeaderH ? rowY - h : max<int>(HeaderH, screenSprite.height() - 8 - h);
     }
-    if (editField == 4) {
-        config.keyboard.layout = config.keyboard.layout == "jp" ? "us" : "jp";
-        editCursor = config.keyboard.layout.length();
-    } else if (editField >= 5) {
-        executeConfigBleAction(editField);
-        return;
-    }
-    dirty = true;
+    return Rect{navW + 180, top, w, h};
 }
 
 void clampEditCursor()
@@ -4110,22 +4669,22 @@ void moveEditCursor(int delta)
         if (editCursor > value.length()) editCursor = value.length();
     }
     cursorVisible = true;
-    lastCursorBlink = millis();
     dirty = true;
 }
 
-void drawTerminal()
+void drawTerminal(bool editorOnly = false)
 {
     if (ssh.connected()) {
         drawVtTerminal();
         return;
     }
     setTerminalFont();
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
+    screenSprite.setTextColor(ui.ansi[10], ui.bg);
     const int lineStep = terminalLineStep();
     const bool drawEditor = terminal.atBottom();
     const size_t editorRow = drawEditor ? terminal.inputViewportRow() : terminal.viewportRows();
     for (size_t row = 0; row < terminal.viewportRows(); ++row) {
+        if (editorOnly && row != editorRow) continue;
         String line = terminal.lineAt(row);
         if (drawEditor && row == editorRow) {
             int lineTop = HeaderH + static_cast<int>(row) * lineStep;
@@ -4141,7 +4700,7 @@ void drawTerminal()
 
             size_t visibleStart = 0;
             while (visibleStart < prefix.length() &&
-                   terminalTextWidth(prefix.substring(visibleStart)) > screenSprite.width() - 16) {
+                   terminalTextWidth(prefix.substring(visibleStart)) > screenSprite.width() - navW - 16) {
                 ++visibleStart;
                 while (visibleStart < prefix.length() &&
                        (static_cast<uint8_t>(prefix[visibleStart]) & 0xC0) == 0x80) {
@@ -4150,136 +4709,591 @@ void drawTerminal()
             }
 
             String visiblePrefix = prefix.substring(visibleStart);
-            int x = 4;
-            x += drawTerminalText(visiblePrefix, x, lineTop, lineStep, TFT_GREEN, TFT_BLACK);
+            int x = navW + 4;
+            {
+                const size_t promptLen = strlen(pythonReplMode ? PythonPrompt : LocalPrompt);
+                const size_t promptShown = promptLen > visibleStart ? promptLen - visibleStart : 0;
+                x += drawTerminalText(visiblePrefix.substring(0, promptShown), x, lineTop, lineStep, ui.ansi[10], ui.bg);
+                x += drawTerminalText(visiblePrefix.substring(promptShown), x, lineTop, lineStep, ui.fg, ui.bg);
+            }
             if (cursorVisible) {
                 int cursorW = max<int>(terminalCellWidth(), terminalTextWidth(cursorGlyph));
-                screenSprite.fillRect(x, lineTop, cursorW, lineStep, TFT_GREEN);
-                drawTerminalText(cursorGlyph, x, lineTop, lineStep, TFT_BLACK, TFT_GREEN);
+                screenSprite.fillRect(x, lineTop, cursorW, lineStep, ui.fg);
+                drawTerminalText(cursorGlyph, x, lineTop, lineStep, ui.bg, ui.fg);
                 x += cursorW;
             } else {
-                x += drawTerminalText(cursorGlyph, x, lineTop, lineStep, TFT_GREEN, TFT_BLACK);
+                x += drawTerminalText(cursorGlyph, x, lineTop, lineStep, ui.fg, ui.bg);
             }
             if (suffix.length()) {
-                drawTerminalText(suffix, x, lineTop, lineStep, TFT_GREEN, TFT_BLACK);
+                drawTerminalText(suffix, x, lineTop, lineStep, ui.fg, ui.bg);
             }
             continue;
         }
         if (line.length() > 0) {
-            drawMixedTerminalLine(line, 4, HeaderH + static_cast<int>(row) * lineStep, lineStep);
+            drawMixedTerminalLine(line, navW + 4, HeaderH + static_cast<int>(row) * lineStep, lineStep);
         }
     }
 }
 
-void drawWifiList()
+struct SdFileEntry {
+    String path;
+};
+
+std::vector<SdFileEntry> sdFiles;
+std::vector<String> keyNames;
+String pageNote;
+String pubKeyShown;
+size_t snippetSelection = 0;
+size_t pendingTheme = 1;
+size_t pendingFont = 1;
+size_t pendingUi = 0;
+uint8_t pendingLine = 24;
+int armedButton = -1;
+Screen armedScreen = Screen::Terminal;
+
+bool isArmed(size_t button)
 {
-    clampSettingScroll(config.wifi.size());
-    drawSettingsTitle("Wi-Fi profiles");
-    setSettingsFontForLine();
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
-    drawFocusedBodyButton(BodyBtn1, "SCAN", 0);
-    drawFocusedBodyButton(BodyBtn2, "ADD", 1);
-    drawFocusedBodyButton(BodyBtn3, "CONNECT", 2, TFT_DARKGREEN);
-    drawFocusedBodyButton(BodyBtn4, wifiDisabled ? "ON" : "OFF", 3, wifiDisabled ? TFT_DARKGREEN : TFT_MAROON);
-    for (size_t row = 0; row < visibleSettingRows(); ++row) {
-        size_t i = settingScrollOffset + row;
-        if (i >= config.wifi.size()) {
-            break;
+    return armedButton == static_cast<int>(button) && armedScreen == screen;
+}
+
+void disarm()
+{
+    armedButton = -1;
+}
+
+size_t toolbarCount()
+{
+    switch (screen) {
+    case Screen::WifiList: return 6;
+    case Screen::WifiScan: return 2;
+    case Screen::SshList: return 6;
+    case Screen::SnipList: return 4;
+    case Screen::BtPage: return 4;
+    case Screen::WgPage: return 5;
+    case Screen::SshKeys: return 5;
+    default: return 0;
+    }
+}
+
+struct ToolbarItem {
+    String label;
+    Btn kind;
+};
+
+ToolbarItem toolbarItem(size_t i)
+{
+    const bool armed = isArmed(i);
+    switch (screen) {
+    case Screen::WifiList:
+        if (i == 0) return {"SCAN", Btn::Normal};
+        if (i == 1) return {"ADD", Btn::Normal};
+        if (i == 2) return {"CONNECT", Btn::Primary};
+        if (i == 3) return {wifiDisabled ? "WIFI ON" : "WIFI OFF", Btn::Normal};
+        if (i == 4) return {"EDIT", Btn::Normal};
+        return {armed ? "CONFIRM" : "DELETE", Btn::Danger};
+    case Screen::WifiScan:
+        return i == 0 ? ToolbarItem{"RESCAN", Btn::Normal} : ToolbarItem{"BACK", Btn::Normal};
+    case Screen::SshList:
+        if (i == 0) return {"ADD", Btn::Normal};
+        if (i == 1) return {"EDIT", Btn::Normal};
+        if (i == 2) return {"CONNECT", Btn::Primary};
+        if (i == 3) return {armed ? "CONFIRM" : "DELETE", Btn::Danger};
+        if (i == 4) return {"KEYS", Btn::Normal};
+        return {"SNIPPETS", Btn::Normal};
+    case Screen::SnipList:
+        if (i == 0) return {"RUN", Btn::Primary};
+        if (i == 1) return {"ADD", Btn::Normal};
+        if (i == 2) return {"EDIT", Btn::Normal};
+        return {armed ? "CONFIRM" : "DELETE", Btn::Danger};
+    case Screen::BtPage:
+        if (i == 0) return {config.keyboard.bleKeyboardEnabled ? "BT OFF" : "BT ON",
+                            config.keyboard.bleKeyboardEnabled ? Btn::Normal : Btn::Primary};
+        if (i == 1) return {"SCAN", Btn::Normal};
+        if (i == 2) return {"PAIR", Btn::Normal};
+        return {armed ? "CONFIRM" : "FORGET", Btn::Danger};
+    case Screen::WgPage:
+        if (i == 0) return {config.wireguard.enabled ? "WG OFF" : "WG ON", config.wireguard.enabled ? Btn::Normal : Btn::Primary};
+        if (i == 1) return {remoteSetup.active() ? "STOP REMOTE" : "REMOTE SETUP", Btn::Normal};
+        if (i == 2) return {"EDIT", Btn::Normal};
+        if (i == 3) return {"RESCAN SD", Btn::Normal};
+        return {armed ? "CONFIRM" : "CLEAR", Btn::Danger};
+    case Screen::SshKeys:
+        if (i == 0) return {"GENERATE", Btn::Primary};
+        if (i == 1) return {remoteSetup.active() ? "STOP REMOTE" : "REMOTE SETUP", Btn::Normal};
+        if (i == 2) return {"SHOW PUB KEY", Btn::Normal};
+        if (i == 3) return {"USE FOR SSH", Btn::Normal};
+        return {armed ? "CONFIRM" : "DELETE", Btn::Danger};
+    default:
+        return {"", Btn::Normal};
+    }
+}
+
+size_t rowCount()
+{
+    switch (screen) {
+    case Screen::WifiList: return config.wifi.size();
+    case Screen::WifiScan: return scannedNetworks.size();
+    case Screen::SshList: return config.ssh.size();
+    case Screen::SnipList: return config.snippets.size();
+    case Screen::BtPage: return config.keyboard.bleDevices.size() + keyboard.bleScanCount();
+    case Screen::WgPage: return sdFiles.size();
+    case Screen::SshKeys: return keyNames.size() + sdFiles.size();
+    default: return 0;
+    }
+}
+
+String rowText(size_t i)
+{
+    switch (screen) {
+    case Screen::WifiList:
+        return config.wifi[i].name + " | " + config.wifi[i].ssid;
+    case Screen::WifiScan:
+        return scannedNetworks[i].ssid + " | " + scannedNetworks[i].rssi + " dBm | " +
+               (scannedNetworks[i].auth == WIFI_AUTH_OPEN ? "open" : "secured");
+    case Screen::SshList: {
+        const auto& p = config.ssh[i];
+        return p.name + " | " + p.user + "@" + p.host + ":" + p.port + (p.keyName.length() ? "  [key: " + p.keyName + "]" : "");
+    }
+    case Screen::SnipList:
+        return config.snippets[i].name + " | " + config.snippets[i].text;
+    case Screen::BtPage: {
+        const size_t paired = config.keyboard.bleDevices.size();
+        if (i < paired) {
+            const auto& d = config.keyboard.bleDevices[i];
+            return String("Paired: ") + (d.name.length() ? d.name : String("BLE HID")) + " | " + d.address + " | " + d.kind;
         }
-        int y = settingListTop() + static_cast<int>(row) * settingRowH();
-        bool selected = !keyboardMenuMode && focusedContentItem == i + 4;
-        uint16_t bg = selected ? TFT_NAVY : TFT_BLACK;
-        screenSprite.fillRect(4, y, screenSprite.width() - 8, settingRowH() - 4, bg);
-        screenSprite.drawRect(4, y, screenSprite.width() - 8, settingRowH() - 4, selected ? TFT_CYAN : TFT_DARKGREY);
-        String line = String(i == activeWifi ? "* " : "  ") + config.wifi[i].name + " | " + config.wifi[i].ssid;
-        setSettingsFontForLine(line);
-        screenSprite.setTextColor(TFT_WHITE, bg);
-        screenSprite.drawString(line, 12, settingTextY(y));
+        return String("Nearby: ") + keyboard.bleScanEntry(i - paired);
+    }
+    case Screen::WgPage:
+        return sdFiles[i].path;
+    case Screen::SshKeys:
+        if (i < keyNames.size()) return keyNames[i];
+        return String("Import from SD: ") + sdFiles[i - keyNames.size()].path;
+    default:
+        return "";
+    }
+}
+
+String rowTag(size_t i)
+{
+    switch (screen) {
+    case Screen::WifiList:
+        if (wifiState == WifiConnectState::Connected && connectedSsidCache == config.wifi[i].ssid) return "CONNECTED";
+        return i == activeWifi ? "ACTIVE" : "";
+    case Screen::SshList:
+        return i == activeSsh ? "ACTIVE" : "";
+    case Screen::BtPage: {
+        const size_t paired = config.keyboard.bleDevices.size();
+        if (i < paired) return i == config.keyboard.activeBle ? "ACTIVE" : "";
+        return (i - paired) == blePairTarget ? "TARGET" : "";
+    }
+    case Screen::WgPage:
+        return "IMPORT";
+    case Screen::SshKeys:
+        if (i < keyNames.size()) {
+            return activeSsh < config.ssh.size() && config.ssh[activeSsh].keyName == keyNames[i] ? "IN USE" : "";
+        }
+        return "IMPORT";
+    default:
+        return "";
+    }
+}
+
+const char* emptyHint()
+{
+    switch (screen) {
+    case Screen::WifiList: return "No saved networks. Use SCAN to find one, or ADD to type one in.";
+    case Screen::WifiScan: return "No networks found. Press RESCAN.";
+    case Screen::SshList: return "No SSH profiles. Press ADD.";
+    case Screen::SnipList: return "No snippets. Press ADD to save a command you run often.";
+    case Screen::BtPage: return "No devices. Put the keyboard in pairing mode and press SCAN.";
+    case Screen::WgPage: return "No WireGuard configs found. Use REMOTE SETUP from a phone or laptop, or copy a .conf file into /wg on the SD card and press RESCAN SD.";
+    case Screen::SshKeys: return "No keys yet. GENERATE one, upload via REMOTE SETUP, or put a private key on the SD card (/ssh) and press SHOW PUB KEY / reopen.";
+    default: return "";
+    }
+}
+
+void drawInfoLine(int line, const String& text, uint16_t color)
+{
+    setSettingsFontForLine(text);
+    screenSprite.setTextColor(color, ui.bg);
+    screenSprite.drawString(text, navW + 12, bodyBtn(0).y + 48 + 10 + line * max(24, uiTextH() + 8));
+}
+
+void drawInfoPanel()
+{
+    if (screen == Screen::BtPage) {
+        String st = keyboard.bleStatus();
+        if (st.length() > 120) st = st.substring(0, 120);
+        drawInfoLine(0, String("Bluetooth keyboards/mice (ESP32-C6 radio): ") +
+                            (config.keyboard.bleKeyboardEnabled ? "enabled" : "disabled"), ui.fg);
+        drawInfoLine(1, st, ui.dim);
+        drawInfoLine(2, pageNote.length() ? pageNote : String("Paired ") + config.keyboard.bleDevices.size() +
+                            "   Nearby " + keyboard.bleScanCount(),
+                     pageNote.length() ? ui.warn : ui.dim);
+    } else if (screen == Screen::WgPage) {
+        const auto& w = config.wireguard;
+        const bool keys = w.privateKey.length() && w.publicKey.length();
+        drawInfoLine(0, String("Tunnel: ") + wireguard.status(w), w.enabled ? ui.accent : ui.dim);
+        drawInfoLine(1, String("Address ") + (w.address.length() ? w.address : String("-")) + "   Peer " +
+                            (w.endpoint.length() ? w.endpoint + ":" + w.port : String("-")) + "   Keys " +
+                            (keys ? "set" : "missing") + (w.presharedKey.length() ? "   PSK set" : ""), ui.fg);
+        if (remoteSetup.active()) {
+            drawInfoLine(2, String("Open ") + remoteSetup.url() + " on a device on this Wi-Fi.  PIN " + remoteSetup.pin(), ui.warn);
+        } else {
+            drawInfoLine(2, "Remote setup off. REMOTE SETUP serves a page for pasting/uploading a WireGuard .conf.", ui.dim);
+        }
+        drawInfoLine(3, pageNote.length() ? pageNote : String("Starts at boot: ") +
+                                                            (w.autoStart ? "always on" : "off (change in CONF)") + ".  Config files on SD:", pageNote.length() ? ui.warn : ui.dim);
+    } else if (screen == Screen::SshKeys) {
+        String used = activeSsh < config.ssh.size() ? config.ssh[activeSsh].keyName : String("");
+        drawInfoLine(0, String("Keys stored on the Tab5 (/keys). Active SSH profile uses: ") +
+                            (used.length() ? used : String("password")), ui.fg);
+        if (remoteSetup.active()) {
+            drawInfoLine(1, String("Open ") + remoteSetup.url() + " on a device on this Wi-Fi.  PIN " + remoteSetup.pin(), ui.warn);
+        } else {
+            drawInfoLine(1, pubKeyShown.length() ? pubKeyShown : String("Select a key, then SHOW PUB KEY to get the line for authorized_keys."), pubKeyShown.length() ? ui.accent : ui.dim);
+        }
+        drawInfoLine(2, pageNote, ui.warn);
+    }
+}
+
+void drawRowBg(int x, int y, int w, int h, bool selected, bool ring)
+{
+    screenSprite.fillRect(x, y, w, h, selected ? ui.sel : ui.bg);
+    if (selected) {
+        screenSprite.fillRect(x, y, 4, h, ui.accent);
+    }
+    screenSprite.drawFastHLine(x, y + h - 1, w, ui.border);
+    if (ring) {
+        screenSprite.drawRect(x, y, w, h, ui.accent);
+    }
+}
+
+// Right-aligned status chip. Returns its left edge.
+int drawTag(const String& tag, int rightEdge, int rowY, int rowH, uint16_t rowBg)
+{
+    (void)rowBg;
+    setSettingsFontForLine();
+    const bool ok = tag == "ACTIVE" || tag == "CONNECTED" || tag == "IN USE" || tag == "TARGET";
+    const int w = screenSprite.textWidth(tag) + 20;
+    const int h = screenSprite.fontHeight() + 8;
+    const int x = rightEdge - w;
+    const int y = rowY + (rowH - h) / 2;
+    screenSprite.fillRoundRect(x, y, w, h, 4, ok ? ui.tagOk : ui.tag);
+    screenSprite.setTextColor(ok ? ui.green : ui.dim, ok ? ui.tagOk : ui.tag);
+    screenSprite.drawString(tag, x + 10, y + 4);
+    return x;
+}
+
+void drawListRows()
+{
+    const size_t total = rowCount();
+    const size_t tb = toolbarCount();
+    clampSettingScroll(total);
+    const int left = navW + 4;
+    const int width = screenSprite.width() - left - 4;
+    if (!total) {
         setSettingsFontForLine();
-        screenSprite.setTextColor(TFT_WHITE, bg);
-        screenSprite.drawString(i == activeWifi ? "ACTIVE" : "SELECT", screenSprite.width() - 170, settingTextY(y));
+        screenSprite.setTextColor(ui.dim, ui.bg);
+        screenSprite.setClipRect(left + 8, settingListTop(), width - 16, 90);
+        screenSprite.drawString(emptyHint(), left + 8, settingListTop() + 8);
+        screenSprite.clearClipRect();
+        return;
     }
-}
-
-void drawWifiScan()
-{
-    clampSettingScroll(scannedNetworks.size());
-    drawSettingsTitle("Wi-Fi scan");
-    setSettingsFontForLine();
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
-    drawFocusedBodyButton(BodyBtn1, "RESCAN", 0);
-    drawFocusedBodyButton(BodyBtn2, "BACK", 1);
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
-    String title = wifiScanActive ? "Wi-Fi Scan: running..." : String("Wi-Fi Scan: ") + scannedNetworks.size() + " SSIDs";
-    screenSprite.drawString(title, 256, HeaderH + 8);
+    const int rowH = settingRowH();
     for (size_t row = 0; row < visibleSettingRows(); ++row) {
         size_t i = settingScrollOffset + row;
-        if (i >= scannedNetworks.size()) {
+        if (i >= total) {
             break;
         }
-        int y = settingListTop() + static_cast<int>(row) * settingRowH();
-        bool selected = !keyboardMenuMode && focusedContentItem == i + 2;
-        uint16_t bg = selected ? TFT_NAVY : TFT_BLACK;
-        screenSprite.fillRect(4, y, screenSprite.width() - 8, settingRowH() - 4, bg);
-        screenSprite.drawRect(4, y, screenSprite.width() - 8, settingRowH() - 4, selected ? TFT_CYAN : TFT_DARKGREY);
-        String security = scannedNetworks[i].auth == WIFI_AUTH_OPEN ? "open" : "secured";
-        String line = scannedNetworks[i].ssid + " | " + scannedNetworks[i].rssi + " dBm | " + security;
+        int y = settingListTop() + static_cast<int>(row) * rowH;
+        bool selected = !keyboardMenuMode && focusedContentItem == i + tb;
+        drawRowBg(left, y, width, rowH - 2, selected, false);
+        const uint16_t bg = selected ? ui.sel : ui.bg;
+        String line = rowText(i);
+        String tag = rowTag(i);
+        int textRight = left + width - 12;
+        if (tag.length()) {
+            textRight = drawTag(tag, left + width - 12, y, rowH - 2, bg) - 12;
+        }
+        screenSprite.setClipRect(left + 8, y, max(10, textRight - left - 8), rowH - 2);
         setSettingsFontForLine(line);
-        screenSprite.setTextColor(TFT_WHITE, bg);
-        screenSprite.drawString(line, 12, settingTextY(y));
+        screenSprite.setTextColor(ui.fg, bg);
+        screenSprite.drawString(line, left + 16, settingTextY(y));
+        screenSprite.clearClipRect();
     }
 }
 
-void drawSshList()
-{
-    clampSettingScroll(config.ssh.size());
-    drawSettingsTitle("SSH profiles");
-    setSettingsFontForLine();
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
-    drawFocusedBodyButton(BodyBtn1, "ADD", 0);
-    drawFocusedBodyButton(BodyBtn2, "EDIT", 1);
-    drawFocusedBodyButton(BodyBtn3, "CONNECT", 2, TFT_DARKGREEN);
-    for (size_t row = 0; row < visibleSettingRows(); ++row) {
-        size_t i = settingScrollOffset + row;
-        if (i >= config.ssh.size()) {
-            break;
-        }
-        int y = settingListTop() + static_cast<int>(row) * settingRowH();
-        bool selected = !keyboardMenuMode && focusedContentItem == i + 3;
-        uint16_t bg = selected ? TFT_NAVY : TFT_BLACK;
-        screenSprite.fillRect(4, y, screenSprite.width() - 8, settingRowH() - 4, bg);
-        screenSprite.drawRect(4, y, screenSprite.width() - 8, settingRowH() - 4, selected ? TFT_CYAN : TFT_DARKGREY);
-        String line = String(i == activeSsh ? "* " : "  ") + config.ssh[i].name + " | " + config.ssh[i].user + "@" +
-                      config.ssh[i].host + ":" + config.ssh[i].port;
-        setSettingsFontForLine(line);
-        screenSprite.setTextColor(TFT_WHITE, bg);
-        screenSprite.drawString(line, 12, settingTextY(y));
-        setSettingsFontForLine();
-        screenSprite.setTextColor(TFT_WHITE, bg);
-        screenSprite.drawString(i == activeSsh ? "ACTIVE" : "SELECT", screenSprite.width() - 170, settingTextY(y));
-    }
-}
-
-void drawEditFields(const char* title, const char* const* labels, uint8_t count, bool sshFields)
+void drawListPage(const char* title)
 {
     drawSettingsTitle(title);
+    setSettingsFontForLine();
+    const size_t n = toolbarCount();
+    for (size_t i = 0; i < n; ++i) {
+        ToolbarItem item = toolbarItem(i);
+        setUiFont();
+        drawFocusedBodyButton(bodyBtn(static_cast<int>(i)), item.label.c_str(), i, item.kind);
+    }
+    drawInfoPanel();
+    drawListRows();
+}
+
+// ---- Theme page (colour scheme + terminal font on one screen) ----
+
+constexpr size_t kThemeFontCount = sizeof(TerminalFonts) / sizeof(TerminalFonts[0]);
+constexpr size_t kUiSizeCount = 3;
+constexpr uint8_t kUiSizes[kUiSizeCount] = {100, 125, 150};
+const char* const kUiSizeLabels[kUiSizeCount] = {"Normal", "Large", "X-Large"};
+const char* const kFontSizeLabels[kThemeFontCount] = {"Small", "Medium", "Large", "X-Large"};
+
+// Focus order on the THEME page: schemes, terminal sizes, UI sizes, spacing -, spacing +, APPLY.
+size_t themeFontFocus(size_t i) { return themeCount() + i; }
+size_t themeUiFocus(size_t i) { return themeCount() + kThemeFontCount + i; }
+size_t themeMinusFocus() { return themeCount() + kThemeFontCount + kUiSizeCount; }
+size_t themePlusFocus() { return themeMinusFocus() + 1; }
+size_t themeApplyFocus() { return themeMinusFocus() + 2; }
+size_t themeFocusCount() { return themeApplyFocus() + 1; }
+
+constexpr int kThemeLeftW = 600;
+
+Rect themeRowRect(size_t i)
+{
+    return Rect{navW + 4, HeaderH + 38 + static_cast<int>(i) * settingRowH(), kThemeLeftW, settingRowH() - 4};
+}
+
+int themeRightX() { return navW + kThemeLeftW + 24; }
+int themeRightW() { return screenSprite.width() - themeRightX() - 6; }
+int themeLabelH() { return uiTextH() + 10; }
+
+int themeFontRowY() { return HeaderH + 8 + themeLabelH(); }
+int themeUiLabelY() { return themeFontRowY() + 44 + 10; }
+int themeUiRowY() { return themeUiLabelY() + themeLabelH(); }
+int themeLineRowY() { return themeUiRowY() + 44 + 12; }
+
+Rect themeSegRect(int rowY, size_t i, size_t count)
+{
+    const int gap = 6;
+    const int w = (themeRightW() - gap * static_cast<int>(count - 1)) / static_cast<int>(count);
+    return Rect{themeRightX() + static_cast<int>(i) * (w + gap), rowY, w, 40};
+}
+
+Rect themeFontBtnRect(size_t i) { return themeSegRect(themeFontRowY(), i, kThemeFontCount); }
+Rect themeUiBtnRect(size_t i) { return themeSegRect(themeUiRowY(), i, kUiSizeCount); }
+Rect themeApplyRect() { return Rect{screenSprite.width() - 140, HeaderH + 4, 132, 32}; }
+Rect themeLineMinusRect() { return Rect{screenSprite.width() - 6 - 124, themeLineRowY(), 60, 40}; }
+Rect themeLinePlusRect() { return Rect{screenSprite.width() - 6 - 60, themeLineRowY(), 60, 40}; }
+
+int minLineStepFor(size_t font)
+{
+    return max<int>(12, TerminalFonts[font].settingsLineHeight + 2);
+}
+
+size_t currentUiSizeIndex()
+{
+    for (size_t i = 0; i < kUiSizeCount; ++i) {
+        if (config.ui.scale == kUiSizes[i]) return i;
+    }
+    return 0;
+}
+
+size_t currentFontIndex()
+{
+    for (size_t i = 0; i < kThemeFontCount; ++i) {
+        if (config.keyboard.terminalFont == TerminalFonts[i].id) return i;
+    }
+    return 1;
+}
+
+void loadPendingTheme()
+{
+    pendingTheme = static_cast<size_t>(max(0, themeIndexById(config.ui.theme)));
+    pendingFont = currentFontIndex();
+    pendingUi = currentUiSizeIndex();
+    pendingLine = terminalLineStep();
+}
+
+bool themePageHasChanges()
+{
+    return config.ui.theme != themeAt(pendingTheme).id || pendingFont != currentFontIndex() ||
+           pendingUi != currentUiSizeIndex() || pendingLine != terminalLineStep();
+}
+
+void drawThemePreview(const Rect& box)
+{
+    const Theme& t = themeAt(pendingTheme);
+    auto c = [](uint32_t rgb) -> uint16_t {
+        return static_cast<uint16_t>(((rgb >> 8) & 0xF800) | ((rgb >> 5) & 0x07E0) | ((rgb >> 3) & 0x001F));
+    };
+    const uint16_t pbg = c(t.bg);
+    const uint16_t pfg = c(t.fg);
+    screenSprite.fillRect(box.x, box.y, box.w, box.h, pbg);
+    screenSprite.drawRect(box.x, box.y, box.w, box.h, ui.border);
+
+    // Preview with the pending font size and spacing, then restore the real settings.
+    const String savedFont = config.keyboard.terminalFont;
+    const uint8_t savedStep = config.keyboard.terminalLineStep;
+    config.keyboard.terminalFont = TerminalFonts[pendingFont].id;
+    config.keyboard.terminalLineStep = pendingLine;
+    setTerminalFont();
+    const int step = terminalLineStep();
+    const int sw = max<int>(10, min<int>(30, (box.w - 16) / 16));
+    const int swatchTop = box.y + box.h - sw * 2 - 12;
+    int y = box.y + 6;
+    const int x = box.x + 8;
+    auto line = [&](std::initializer_list<std::pair<const char*, uint16_t>> parts) {
+        if (y + step > swatchTop) {
+            return;
+        }
+        int px = x;
+        for (const auto& part : parts) {
+            px += drawTerminalText(part.first, px, y, step, part.second, pbg);
+        }
+        y += step;
+    };
+    line({{"tab5@host", c(t.ansi[10])}, {":", pfg}, {"~/src", c(t.ansi[12])}, {"$ ", pfg}, {"ls -la", pfg}});
+    line({{"drwxr-xr-x ", pfg}, {"build/", c(t.ansi[12])}, {"  -rwxr-xr-x ", pfg}, {"run.sh", c(t.ansi[10])}});
+    line({{"warning: ", c(t.ansi[11])}, {"disk 91% full", pfg}});
+    line({{"error: ", c(t.ansi[9])}, {"permission denied", pfg}});
+    line({{"tab5@host", c(t.ansi[10])}, {"$ ", pfg}});
+    config.keyboard.terminalFont = savedFont;
+    config.keyboard.terminalLineStep = savedStep;
+    for (int i = 0; i < 16; ++i) {
+        screenSprite.fillRect(box.x + 8 + (i % 8) * sw * 2, swatchTop + (i / 8) * (sw + 2), sw * 2 - 2, sw,
+                              c(t.ansi[i]));
+    }
+}
+
+void drawThemePage()
+{
+    setSettingsFontForLine();
+    screenSprite.setTextColor(ui.dim, ui.bg);
+    screenSprite.drawString("COLOR SCHEME", navW + 8, HeaderH + 12);
+    auto c565 = [](uint32_t c) -> uint16_t {
+        return static_cast<uint16_t>(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
+    };
+    for (size_t i = 0; i < themeCount(); ++i) {
+        const Theme& t = themeAt(i);
+        Rect r = themeRowRect(i);
+        const bool picked = i == pendingTheme;
+        const bool applied = themeCurrent().id == t.id;
+        const bool focused = !keyboardMenuMode && focusedContentItem == i;
+        drawRowBg(r.x, r.y, r.w, r.h, picked, focused);
+        setSettingsFontForLine();
+        screenSprite.setTextColor(ui.fg, picked ? ui.sel : ui.bg);
+        screenSprite.drawString(t.name, r.x + 16, settingTextY(r.y));
+        if (applied) {
+            drawTag("ACTIVE", r.x + r.w - 244, r.y, r.h, picked ? ui.sel : ui.bg);
+        }
+        // mini preview: the scheme's own background, text and six accent colours
+        const int px = r.x + r.w - 232;
+        screenSprite.fillRoundRect(px, r.y + 5, 224, r.h - 12, 3, c565(t.bg));
+        screenSprite.setTextColor(c565(t.fg), c565(t.bg));
+        setUiFont();
+        screenSprite.setTextSize(1);
+        screenSprite.drawString("Abc", px + 8, r.y + (r.h - 16) / 2 - 1);
+        for (int k = 0; k < 6; ++k) {
+            screenSprite.fillRect(px + 56 + k * 27, r.y + 12, 23, r.h - 26, c565(t.ansi[1 + k]));
+        }
+    }
+
+    setSettingsFontForLine();
+    screenSprite.setTextColor(ui.dim, ui.bg);
+    screenSprite.drawString(String("TERMINAL FONT SIZE  ") + TerminalFonts[pendingFont].cellW + "x" +
+                                TerminalFonts[pendingFont].cellH,
+                            themeRightX(), HeaderH + 12);
+    setUiFont();
+    for (size_t i = 0; i < kThemeFontCount; ++i) {
+        drawButton(themeFontBtnRect(i), kFontSizeLabels[i], i == pendingFont ? Btn::Active : Btn::Normal,
+                   !keyboardMenuMode && focusedContentItem == themeFontFocus(i));
+    }
+    setSettingsFontForLine();
+    screenSprite.setTextColor(ui.dim, ui.bg);
+    screenSprite.drawString("INTERFACE TEXT SIZE", themeRightX(), themeUiLabelY() + 4);
+    setUiFont();
+    for (size_t i = 0; i < kUiSizeCount; ++i) {
+        drawButton(themeUiBtnRect(i), kUiSizeLabels[i], i == pendingUi ? Btn::Active : Btn::Normal,
+                   !keyboardMenuMode && focusedContentItem == themeUiFocus(i));
+    }
+    setSettingsFontForLine();
+    screenSprite.setTextColor(ui.fg, ui.bg);
+    screenSprite.drawString(String("Line spacing  ") + pendingLine + " px", themeRightX(), themeLineRowY() + 10);
+    setUiFont();
+    drawButton(themeLineMinusRect(), "-", Btn::Normal, !keyboardMenuMode && focusedContentItem == themeMinusFocus());
+    drawButton(themeLinePlusRect(), "+", Btn::Normal, !keyboardMenuMode && focusedContentItem == themePlusFocus());
+    drawFocusedBodyButton(themeApplyRect(), "APPLY", themeApplyFocus(),
+                          themePageHasChanges() ? Btn::Primary : Btn::Normal);
+
+    const int previewTop = themeLineRowY() + 40 + 12;
+    const int previewH = screenSprite.height() - 30 - previewTop;
+    if (previewH > 60) {
+        drawThemePreview(Rect{themeRightX(), previewTop, themeRightW(), previewH});
+    }
+}
+
+// ---- Edit forms ----
+
+void drawDropdown()
+{
+    if (!dropdownOpen || dropdownOptions.empty()) {
+        return;
+    }
+    const Rect r = dropdownRect();
+    const int rowH = settingRowH();
+    screenSprite.fillRoundRect(r.x, r.y, r.w, r.h, 4, ui.chrome);
+    screenSprite.drawRoundRect(r.x, r.y, r.w, r.h, 4, ui.accent);
+    const size_t visible = min(kDropdownRows, dropdownOptions.size());
+    for (size_t k = 0; k < visible; ++k) {
+        const size_t idx = dropdownTop + k;
+        if (idx >= dropdownOptions.size()) {
+            break;
+        }
+        const int y = r.y + 2 + static_cast<int>(k) * rowH;
+        const bool sel = idx == dropdownSel;
+        const uint16_t bg = sel ? ui.sel : ui.chrome;
+        screenSprite.fillRect(r.x + 3, y, r.w - 6, rowH - 2, bg);
+        setSettingsFontForLine(dropdownOptions[idx].label);
+        screenSprite.setTextColor(dropdownOptions[idx].custom ? ui.dim : ui.fg, bg);
+        screenSprite.setClipRect(r.x + 4, y, r.w - 24, rowH - 2);
+        screenSprite.drawString(dropdownOptions[idx].label, r.x + 12, settingTextY(y));
+        screenSprite.clearClipRect();
+    }
+    if (dropdownOptions.size() > kDropdownRows) {
+        const int trackH = r.h - 8;
+        const int thumbH = max<int>(16, trackH * static_cast<int>(kDropdownRows) / static_cast<int>(dropdownOptions.size()));
+        const int thumbY = r.y + 4 + (trackH - thumbH) * static_cast<int>(dropdownTop) /
+                                         static_cast<int>(dropdownOptions.size() - kDropdownRows);
+        screenSprite.fillRect(r.x + r.w - 12, thumbY, 6, thumbH, ui.accent);
+    }
+}
+
+void drawEditFields(const char* title)
+{
+    drawSettingsTitle(title);
+    size_t count = 0;
+    const FieldSpec* specs = fieldSpecs(count);
+    const int rowH = settingRowH();
+    const int left = navW + 4;
+    const int width = screenSprite.width() - left - 4;
     for (uint8_t i = 0; i < count; ++i) {
-        int y = settingListTop() + i * settingRowH();
-        uint16_t bg = i == editField ? TFT_NAVY : TFT_BLACK;
-        screenSprite.fillRect(4, y, screenSprite.width() - 8, settingRowH() - 4, bg);
-        screenSprite.drawRect(4, y, screenSprite.width() - 8, settingRowH() - 4, i == editField ? TFT_CYAN : TFT_DARKGREY);
-        screenSprite.setTextColor(TFT_WHITE, bg);
-        setSettingsFontForLine(labels[i]);
-        screenSprite.drawString(labels[i], 12, settingTextY(y));
-        String rawValue;
-        if (screen == Screen::WifiEdit) rawValue = wifiFieldValue(i);
-        else if (screen == Screen::SshEdit) rawValue = sshFieldValue(i);
-        else rawValue = configFieldValue(i);
-        bool secret = (screen == Screen::SshEdit && i == 4) || (screen == Screen::WifiEdit && i == 2);
-        bool choiceField = screen == Screen::ConfigEdit && (i == 4 || i == 5 || i >= 8);
-        String value = safeValue(rawValue, secret);
-        size_t cursor = (i == editField && !choiceField) ? min(editCursor, rawValue.length()) : rawValue.length();
-        if (secret) cursor = min(cursor, value.length());
+        const FieldSpec& spec = specs[i];
+        int y = settingListTop() + i * rowH;
+        const bool focused = i == editField;
+        const uint16_t bg = focused ? ui.sel : ui.bg;
+        drawRowBg(left, y, width, rowH - 2, focused, false);
+        screenSprite.setTextColor(ui.dim, bg);
+        setSettingsFontForLine(spec.label);
+        screenSprite.drawString(spec.label, left + 16, settingTextY(y));
+        String rawValue = screen == Screen::WifiEdit ? wifiFieldValue(i)
+                        : screen == Screen::SshEdit ? sshFieldValue(i)
+                        : screen == Screen::WgEdit ? wgFieldValue(i)
+                        : screen == Screen::SnipEdit ? snipFieldValue(i)
+                                                   : configFieldValue(i);
+        const bool hasList = spec.choices != Choices::None;
+        const bool noCursor = spec.strict;
+        String value = safeValue(rawValue, spec.secret);
+        size_t cursor = (focused && !noCursor) ? min(editCursor, rawValue.length()) : rawValue.length();
+        if (spec.secret) cursor = min(cursor, value.length());
         String prefix = value.substring(0, cursor);
         String cursorGlyph = " ";
         String suffix = "";
@@ -4288,21 +5302,24 @@ void drawEditFields(const char* title, const char* const* labels, uint8_t count,
             cursorGlyph = value.substring(cursor, next);
             suffix = value.substring(next);
         }
-        while (prefix.length() && screenSprite.textWidth(prefix + cursorGlyph + suffix) > screenSprite.width() - 195) {
+        const int valueX = navW + 190 + static_cast<int>((config.ui.scale - 100) * 2);
+        const int valueMax = screenSprite.width() - valueX - 24 - (hasList ? 70 : 0);
+        while (prefix.length() && screenSprite.textWidth(prefix + cursorGlyph + suffix) > valueMax) {
             uint8_t len = utf8CharLength(static_cast<uint8_t>(prefix[0]));
             prefix = prefix.substring(len);
         }
         setSettingsFontForLine(value);
-        int x = 180;
+        screenSprite.setTextColor(ui.fg, bg);
+        int x = valueX;
         int textY = settingTextY(y);
         screenSprite.drawString(prefix, x, textY);
         x += screenSprite.textWidth(prefix);
-        if (i == editField && !choiceField && cursorVisible) {
+        if (focused && !noCursor && cursorVisible) {
             int cursorW = max<int>(terminalCellWidth(), screenSprite.textWidth(cursorGlyph));
-            screenSprite.fillRect(x, y + 3, cursorW, settingRowH() - 10, TFT_GREEN);
-            screenSprite.setTextColor(TFT_BLACK, TFT_GREEN);
+            screenSprite.fillRect(x, y + 3, cursorW, rowH - 10, ui.accent);
+            screenSprite.setTextColor(ui.onAccent, ui.accent);
             screenSprite.drawString(cursorGlyph, x, textY);
-            screenSprite.setTextColor(TFT_WHITE, bg);
+            screenSprite.setTextColor(ui.fg, bg);
             x += cursorW;
         } else {
             screenSprite.drawString(cursorGlyph, x, textY);
@@ -4311,42 +5328,48 @@ void drawEditFields(const char* title, const char* const* labels, uint8_t count,
         if (suffix.length()) {
             screenSprite.drawString(suffix, x, textY);
         }
+        if (hasList) {
+            const Rect a = dropdownArrowRect(y);
+            const int cx = a.x + a.w / 2;
+            const int cy = a.y + a.h / 2;
+            screenSprite.fillTriangle(cx - 9, cy - 5, cx + 9, cy - 5, cx, cy + 6, focused ? ui.accent : ui.dim);
+        }
     }
-}
-
-void drawFontList()
-{
-    drawSettingsTitle("Font settings");
-    setSettingsFontForLine();
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
-    drawFocusedBodyButton(FontMinusBtn, "-", 0);
-    drawFocusedBodyButton(FontPlusBtn, "+", 1);
-    drawFocusedBodyButton(FontSaveBtn, "SAVE", 2, TFT_DARKGREEN);
-    screenSprite.setTextColor(TFT_GREEN, TFT_BLACK);
-    screenSprite.drawString("Terminal font", 428, HeaderH + 16);
-    screenSprite.drawString(String("Line step: ") + terminalLineStep() + " px", 428, HeaderH + 40);
-
-    constexpr size_t fontCount = sizeof(TerminalFonts) / sizeof(TerminalFonts[0]);
-    for (size_t i = 0; i < fontCount; ++i) {
-        int y = settingListTop() + static_cast<int>(i) * settingRowH();
-        bool selected = config.keyboard.terminalFont == TerminalFonts[i].id;
-        bool focused = !keyboardMenuMode && focusedContentItem == i + 3;
-        uint16_t bg = selected ? TFT_NAVY : TFT_BLACK;
-        screenSprite.fillRect(4, y, screenSprite.width() - 8, settingRowH() - 4, bg);
-        screenSprite.drawRect(4, y, screenSprite.width() - 8, settingRowH() - 4, focused ? TFT_CYAN : TFT_DARKGREY);
-        screenSprite.setTextColor(TFT_WHITE, bg);
-        String line = String(selected ? "* " : "  ") + TerminalFonts[i].label + "  default line " +
-                      TerminalFonts[i].defaultLineStep + " px";
-        setSettingsFontForLine(line);
-        screenSprite.drawString(line, 12, settingTextY(y));
-    }
+    drawDropdown();
 }
 
 void draw()
 {
+    const uint32_t buildStart = micros();
+    const bool localTerminal = screen == Screen::Terminal && !ssh.connected();
+    const size_t editorRow = localTerminal ? terminal.inputViewportRow() : SIZE_MAX;
+    const bool editorOnly = localTerminal && lastDrawWasLocalTerminal && !keyboardMenuMode &&
+                            !headerDirty && terminal.atBottom() &&
+                            terminal.generation() == lastDrawnTerminalGeneration &&
+                            editorRow == lastDrawnEditorRow;
+    if (editorOnly) {
+        const int y = HeaderH + static_cast<int>(editorRow) * terminalLineStep();
+        const int h = min<int>(terminalLineStep(), screenSprite.height() - y);
+        if (h > 0) {
+            screenSprite.startWrite();
+            screenSprite.fillRect(navW, y, screenSprite.width() - navW, h, ui.bg);
+            drawTerminal(true);
+            screenSprite.endWrite();
+            lastDrawBuildUs = micros() - buildStart;
+            const uint32_t pushStart = micros();
+            M5.Display.setRotation(0);
+            M5.Display.setClipRect(y, 0, h, M5.Display.height());
+            screenSprite.pushSprite(0, 0);
+            M5.Display.clearClipRect();
+            M5.Display.setRotation(3);
+            lastDrawPushUs = micros() - pushStart;
+            dirty = false;
+            return;
+        }
+    }
     screenSprite.startWrite();
     if (!(screen == Screen::Terminal && ssh.connected())) {
-        screenSprite.fillScreen(TFT_BLACK);
+        screenSprite.fillScreen(ui.bg);
     }
     setUiFont();
     drawHeader();
@@ -4354,28 +5377,48 @@ void draw()
     if (screen == Screen::Terminal) {
         drawTerminal();
     } else if (screen == Screen::WifiList) {
-        drawWifiList();
+        drawListPage("Wi-Fi profiles");
     } else if (screen == Screen::WifiScan) {
-        drawWifiScan();
+        drawListPage(wifiScanActive ? "Wi-Fi scan: running..." : "Wi-Fi scan");
     } else if (screen == Screen::SshList) {
-        drawSshList();
+        drawListPage("SSH profiles");
+    } else if (screen == Screen::SnipList) {
+        drawListPage("Snippets");
+    } else if (screen == Screen::SnipEdit) {
+        drawEditFields("Edit snippet   (Run sends the command plus Enter)");
+    } else if (screen == Screen::BtPage) {
+        drawListPage("Bluetooth");
+    } else if (screen == Screen::WgPage) {
+        drawListPage("WireGuard");
+    } else if (screen == Screen::SshKeys) {
+        drawListPage("SSH keys");
     } else if (screen == Screen::WifiEdit) {
-        static const char* const labels[] = {"Name", "SSID", "Password"};
-        drawEditFields("Edit Wi-Fi", labels, 3, false);
+        drawEditFields("Edit Wi-Fi   (Enter on a v field opens its list; you can also type)");
     } else if (screen == Screen::SshEdit) {
-        static const char* const labels[] = {"Name", "Host", "Port", "User", "Password", "Term"};
-        drawEditFields("Edit SSH", labels, 6, true);
+        drawEditFields("Edit SSH   (Enter on a v field opens its list)");
+    } else if (screen == Screen::WgEdit) {
+        drawEditFields("Edit WireGuard   (or import a .conf from the WG tab)");
     } else if (screen == Screen::ConfigEdit) {
-        static const char* const labels[] = {"Device",     "Region",   "UTC min",    "NTP",
-                                             "Keymap",     "BLE KB",   "BLE Name",   "BLE Addr",
-                                             "BLE Target", "BLE Scan", "BLE Pair",   "BLE Forget"};
-        drawEditFields("Config", labels, 12, false);
-    } else if (screen == Screen::FontList) {
-        drawFontList();
+        drawEditFields("Config   (Enter on a v field opens its list; you can also type)");
+    } else if (screen == Screen::ThemeList) {
+        drawThemePage();
+    }
+    if (screen != Screen::Terminal) {
+        setUiFont();
+        screenSprite.setTextColor(ui.dim, ui.bg);
+        screenSprite.drawString(statusLine.substring(0, 150), navW + 8, screenSprite.height() - uiTextH() - 6);
     }
 
     screenSprite.endWrite();
+    lastDrawBuildUs = micros() - buildStart;
+    const uint32_t pushStart = micros();
+    M5.Display.setRotation(0);
     screenSprite.pushSprite(0, 0);
+    M5.Display.setRotation(3);
+    lastDrawPushUs = micros() - pushStart;
+    lastDrawWasLocalTerminal = localTerminal;
+    lastDrawnTerminalGeneration = terminal.generation();
+    lastDrawnEditorRow = editorRow;
     dirty = false;
     headerDirty = false;
 }
@@ -4385,7 +5428,11 @@ void drawHeaderOnly()
     screenSprite.startWrite();
     drawHeader();
     screenSprite.endWrite();
+    M5.Display.setRotation(0);
+    M5.Display.setClipRect(0, 0, HeaderH, M5.Display.height());
     screenSprite.pushSprite(0, 0);
+    M5.Display.clearClipRect();
+    M5.Display.setRotation(3);
     headerDirty = false;
 }
 
@@ -4556,22 +5603,723 @@ void selectScannedWifi(size_t index)
     dirty = true;
 }
 
+void refreshKeyNames()
+{
+    keyNames = SshKeys::list();
+    std::sort(keyNames.begin(), keyNames.end());
+}
+
+// True when the file's content (not just its name) is a WireGuard config or an SSH private key.
+bool sdFileHasContent(const String& path, bool forKeys)
+{
+    File f = SD.open(path, "r");
+    if (!f || f.isDirectory()) {
+        return false;
+    }
+    const size_t size = f.size();
+    if (size < 40 || size > (forKeys ? 8192 : 4096)) {
+        return false;
+    }
+    String text = f.readString();
+    f.close();
+    text.toLowerCase();
+    if (forKeys) {
+        return text.indexOf("private key") >= 0;
+    }
+    return text.indexOf("[interface]") >= 0 && text.indexOf("privatekey") >= 0;
+}
+
+void scanSdDir(const String& dirPath, bool forKeys, int depth, int& budget)
+{
+    File dir = SD.open(dirPath);
+    if (!dir || !dir.isDirectory()) {
+        return;
+    }
+    std::vector<String> subdirs;
+    for (File f = dir.openNextFile(); f && budget > 0 && sdFiles.size() < 40; f = dir.openNextFile()) {
+        --budget;
+        const String name = basenameOnly(String(f.name()));
+        if (f.isDirectory()) {
+            if (depth > 0 && name[0] != '.' && name != "System Volume Information") {
+                subdirs.push_back(joinSdPath(dirPath, name));
+            }
+            continue;
+        }
+        String lower = name;
+        lower.toLowerCase();
+        if (lower.endsWith(".pub") || lower == "known_hosts" || lower == "authorized_keys") {
+            continue;
+        }
+        if (!forKeys && !(lower.endsWith(".conf") || lower.endsWith(".wg") || lower.endsWith(".txt"))) {
+            continue;
+        }
+        const String path = joinSdPath(dirPath, name);
+        if (sdFileHasContent(path, forKeys)) {
+            sdFiles.push_back({path});
+        }
+    }
+    dir.close();
+    for (const auto& sub : subdirs) {
+        if (budget > 0 && sdFiles.size() < 40) {
+            scanSdDir(sub, forKeys, depth - 1, budget);
+        }
+    }
+}
+
+// Quick scan checks the usual folders; a deep scan (RESCAN SD) also walks sub-folders.
+void scanSdFiles(bool forKeys, bool deep = false)
+{
+    sdFiles.clear();
+    if (!ensureSdReady()) {
+        pageNote = String("SD card not ready: ") + sdLastError;
+        return;
+    }
+    static const char* const wgDirs[] = {"/wg", "/WireGuard", "/wireguard", "/vpn", "/"};
+    static const char* const keyDirs[] = {"/ssh", "/.ssh", "/keys", "/"};
+    const char* const* dirs = forKeys ? keyDirs : wgDirs;
+    const size_t dirCount = forKeys ? 4 : 5;
+    int budget = deep ? 600 : 120;
+    for (size_t d = 0; d < dirCount && sdFiles.size() < 40; ++d) {
+        scanSdDir(dirs[d], forKeys, deep && String(dirs[d]) == "/" ? 3 : 0, budget);
+    }
+    if (!sdFiles.size()) {
+        pageNote = forKeys ? "" : (deep ? "No WireGuard config found anywhere on the SD card."
+                                        : "No WireGuard config in /wg or the card root. RESCAN SD searches every folder.");
+    }
+}
+String sanitizeKeyName(const String& base)
+{
+    String out;
+    for (size_t i = 0; i < base.length() && out.length() < 32; ++i) {
+        const char c = base[i];
+        out += (isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-') ? c : '_';
+    }
+    while (out.startsWith(".")) out.remove(0, 1);
+    return out.length() ? out : String("key");
+}
+
+String uniqueKeyName(const String& wanted)
+{
+    String base = sanitizeKeyName(wanted);
+    if (!SshKeys::exists(base)) return base;
+    for (int n = 2; n < 100; ++n) {
+        String suffix = String("-") + n;
+        String candidate = base.substring(0, 32 - suffix.length()) + suffix;
+        if (!SshKeys::exists(candidate)) return candidate;
+    }
+    return base;
+}
+
+String keyPassphraseFor(const String& keyName)
+{
+    for (const auto& p : config.ssh) {
+        if (p.keyName == keyName && p.keyPassphrase.length()) return p.keyPassphrase;
+    }
+    return "";
+}
+
+bool importWireGuardText(const String& text, String& result)
+{
+    WireGuardConfig parsed;
+    String notes;
+    if (!WireGuardRuntime::parseConf(text, parsed, notes, result)) {
+        return false;
+    }
+    parsed.enabled = false; // a new config never switches the tunnel on by itself
+    parsed.autoStart = config.wireguard.autoStart;
+    wireguard.stop();
+    config.wireguard = parsed;
+    if (!saveConfig()) {
+        result = "could not save WireGuard config";
+        return false;
+    }
+    result = String("WireGuard config imported: ") + parsed.endpoint + ":" + parsed.port +
+             (notes.length() ? String(" (") + notes + ")" : String(""));
+    return true;
+}
+
+void enterScreen(Screen next)
+{
+    screen = next;
+    keyboardMenuMode = false;
+    settingScrollOffset = 0;
+    focusedContentItem = 0;
+    pageNote = "";
+    pubKeyShown = "";
+    disarm();
+    if (dropdownOpen) {
+        closeDropdown();
+    }
+    if (next == Screen::ThemeList) {
+        loadPendingTheme();
+    }
+    if (next == Screen::WgPage) {
+        scanSdFiles(false);
+    } else if (next == Screen::SshKeys) {
+        refreshKeyNames();
+        scanSdFiles(true);
+    }
+    dirty = true;
+}
+
+size_t selectedRow()
+{
+    const size_t tb = toolbarCount();
+    if (focusedContentItem >= tb) {
+        return focusedContentItem - tb;
+    }
+    switch (screen) {
+    case Screen::WifiList: return activeWifi;
+    case Screen::SshList: return activeSsh;
+    case Screen::SnipList: return snippetSelection;
+    default: return SIZE_MAX;
+    }
+}
+
+void deleteWifiProfile(size_t index)
+{
+    if (index >= config.wifi.size()) {
+        return;
+    }
+    const String name = config.wifi[index].name;
+    config.wifi.erase(config.wifi.begin() + index);
+    if (index < activeWifi) {
+        --activeWifi;
+    }
+    if (activeWifi >= config.wifi.size()) {
+        activeWifi = 0;
+    }
+    scheduleSave();
+    appendStatus(String("Deleted Wi-Fi: ") + name);
+    focusedContentItem = toolbarCount() + min(index, config.wifi.empty() ? size_t(0) : config.wifi.size() - 1);
+}
+
+void deleteSshProfile(size_t index)
+{
+    if (index >= config.ssh.size()) {
+        return;
+    }
+    const String name = config.ssh[index].name;
+    config.ssh.erase(config.ssh.begin() + index);
+    if (index < activeSsh) {
+        --activeSsh;
+    }
+    if (activeSsh >= config.ssh.size()) {
+        activeSsh = 0;
+    }
+    scheduleSave();
+    appendStatus(String("Deleted SSH profile: ") + name);
+    focusedContentItem = toolbarCount() + min(index, config.ssh.empty() ? size_t(0) : config.ssh.size() - 1);
+}
+
+// Scan and pair block the UI thread for several seconds: say so before starting, and
+// draw once now because no further frames are drawn until the call returns.
+void startBlePhase(const char* note)
+{
+    pageNote = note;
+    appendStatus(note);
+    dirty = true;
+    draw();
+}
+
+void btScan()
+{
+    config.keyboard.bleKeyboardEnabled = true;
+    keyboard.configure(config.keyboard);
+    saveConfig();
+    startBlePhase("Scanning for Bluetooth devices. The screen pauses for several seconds...");
+    String result;
+    bool ok = keyboard.bleScan(result);
+    blePairTarget = 0;
+    pageNote = String(ok ? "Scan done: " : "Scan failed: ") + result;
+    appendStatus(pageNote);
+    if (keyboard.bleScanCount()) {
+        focusedContentItem = toolbarCount() + config.keyboard.bleDevices.size();
+    }
+    dirty = true;
+}
+
+void btPair()
+{
+    if (!keyboard.bleScanCount()) {
+        pageNote = "Nothing to pair: press SCAN first, then pick a nearby device.";
+        return;
+    }
+    startBlePhase("Pairing. Keep the device in pairing mode; the screen pauses until it finishes...");
+    String result;
+    bool ok = keyboard.blePair(blePairTarget, result);
+    if (ok) {
+        saveBlePairingFromKeyboard();
+    }
+    pageNote = String(ok ? "Paired: " : "Pair failed: ") + result;
+    appendStatus(pageNote);
+    dirty = true;
+}
+
+void btForget()
+{
+    const size_t paired = config.keyboard.bleDevices.size();
+    const size_t sel = selectedRow();
+    if (sel == SIZE_MAX || sel >= paired) {
+        pageNote = "Select a paired device in the list first.";
+        disarm();
+        return;
+    }
+    startBlePhase("Forgetting device...");
+    String result;
+    keyboard.bleDisconnect(static_cast<int>(sel), result);
+    String configResult;
+    removeBleDeviceConfig(static_cast<int>(sel), configResult);
+    pageNote = configResult;
+    focusedContentItem = 0;
+}
+
+void generateSshKey()
+{
+    String name;
+    for (int n = 1; n < 100; ++n) {
+        name = String("tab5-") + n;
+        if (!SshKeys::exists(name)) break;
+    }
+    String error;
+    pageNote = "Generating ed25519 key...";
+    dirty = true;
+    draw();
+    if (!SshKeys::generate(name, "", error)) {
+        pageNote = String("Generate failed: ") + error;
+        return;
+    }
+    refreshKeyNames();
+    for (size_t i = 0; i < keyNames.size(); ++i) {
+        if (keyNames[i] == name) {
+            focusedContentItem = toolbarCount() + i;
+        }
+    }
+    pubKeyShown = SshKeys::publicLine(name, "", error);
+    pageNote = String("Created ") + name;
+    if (pubKeyShown.length()) {
+        appendStatus(String("public key: ") + pubKeyShown);
+        if (ensureSdReady()) {
+            SD.mkdir("/ssh");
+            File f = SD.open(String("/ssh/") + name + ".pub", "w");
+            if (f) {
+                f.println(pubKeyShown);
+                pageNote += String("; public key copied to SD /ssh/") + name + ".pub";
+            }
+        }
+    }
+}
+
+void showSelectedPubKey()
+{
+    const size_t sel = selectedRow();
+    if (sel == SIZE_MAX || sel >= keyNames.size()) {
+        pageNote = "Select a key in the list first.";
+        return;
+    }
+    String error;
+    pubKeyShown = SshKeys::publicLine(keyNames[sel], keyPassphraseFor(keyNames[sel]), error);
+    if (pubKeyShown.length()) {
+        appendStatus(String("public key: ") + pubKeyShown);
+        pageNote = "Also printed in the TERM tab and on serial.";
+    } else {
+        pageNote = error;
+    }
+}
+
+void useSelectedKey()
+{
+    const size_t sel = selectedRow();
+    if (sel == SIZE_MAX || sel >= keyNames.size()) {
+        pageNote = "Select a key in the list first.";
+        return;
+    }
+    if (activeSsh >= config.ssh.size()) {
+        pageNote = "No active SSH profile; add one first.";
+        return;
+    }
+    config.ssh[activeSsh].keyName = keyNames[sel];
+    saveConfig();
+    pageNote = String("SSH profile '") + config.ssh[activeSsh].name + "' now logs in with key " + keyNames[sel];
+}
+
+void deleteSelectedKey()
+{
+    const size_t sel = selectedRow();
+    if (sel == SIZE_MAX || sel >= keyNames.size()) {
+        pageNote = "Select a key in the list first.";
+        disarm();
+        return;
+    }
+    const String name = keyNames[sel];
+    SshKeys::remove(name);
+    for (auto& p : config.ssh) {
+        if (p.keyName == name) {
+            p.keyName = "";
+            p.keyPassphrase = "";
+        }
+    }
+    saveConfig();
+    refreshKeyNames();
+    pageNote = String("Deleted key ") + name;
+    focusedContentItem = 0;
+}
+
+void toggleRemoteSetup()
+{
+    if (remoteSetup.active()) {
+        remoteSetup.stop();
+        pageNote = "Remote setup stopped.";
+    } else {
+        String error;
+        pageNote = remoteSetup.start(error) ? "" : error;
+    }
+    dirty = true;
+}
+
+void toggleWireGuard()
+{
+    if (!config.wireguard.enabled) {
+        String error;
+        if (!WireGuardRuntime::validate(config.wireguard, error)) {
+            pageNote = String("Cannot enable: ") + error;
+            return;
+        }
+        config.wireguard.enabled = true;
+        pageNote = "";
+    } else {
+        config.wireguard.enabled = false;
+        wireguard.stop();
+    }
+    saveConfig();
+}
+
+void beginWgEdit()
+{
+    screen = Screen::WgEdit;
+    editField = 0;
+    setEditCursorToEnd();
+    dirty = true;
+}
+
+void applyPendingTheme()
+{
+    if (!themePageHasChanges()) {
+        return;
+    }
+    const bool fontChanged = pendingFont != currentFontIndex() || pendingLine != terminalLineStep();
+    config.ui.theme = themeAt(pendingTheme).id;
+    config.ui.scale = kUiSizes[pendingUi];
+    themeApply(config.ui.theme);
+    if (fontChanged) {
+        config.keyboard.terminalFont = TerminalFonts[pendingFont].id;
+        config.keyboard.terminalLineStep = pendingLine;
+        configureTerminal();
+    }
+    vt.markAllDirty();
+    lastDrawnTerminalGeneration = UINT32_MAX;
+    saveConfig();
+    loadPendingTheme();
+    dirty = true;
+}
+
+void adjustPendingLine(int delta)
+{
+    const int next = constrain(static_cast<int>(pendingLine) + delta, minLineStepFor(pendingFont), 80);
+    pendingLine = static_cast<uint8_t>(next);
+    dirty = true;
+}
+
+void pickPendingFont(size_t i)
+{
+    pendingFont = i;
+    pendingLine = static_cast<uint8_t>(max<int>(TerminalFonts[i].defaultLineStep, minLineStepFor(i)));
+    dirty = true;
+}
+
+void applyThemeIndex(size_t index)
+{
+    if (index >= themeCount()) {
+        return;
+    }
+    config.ui.theme = themeAt(index).id;
+    themeApply(config.ui.theme);
+    vt.markAllDirty();
+    lastDrawnTerminalGeneration = UINT32_MAX;
+    saveConfig();
+    dirty = true;
+}
+
+void applyFontIndex(size_t index)
+{
+    if (index >= kThemeFontCount) {
+        return;
+    }
+    config.keyboard.terminalFont = TerminalFonts[index].id;
+    config.keyboard.terminalLineStep =
+        max<uint8_t>(TerminalFonts[index].defaultLineStep, max(terminalFontHeight(false), terminalFontHeight(true)));
+    configureTerminal();
+    vt.markAllDirty();
+    saveConfig();
+    dirty = true;
+}
+
+void beginSnipEdit(size_t index)
+{
+    editIndex = index;
+    editField = 0;
+    screen = Screen::SnipEdit;
+    setEditCursorToEnd();
+    dirty = true;
+}
+
+void runSnippet(size_t index)
+{
+    if (index >= config.snippets.size()) {
+        pageNote = "Select a snippet first.";
+        return;
+    }
+    const String text = config.snippets[index].text;
+    screen = Screen::Terminal;
+    vt.markAllDirty();
+    lastDrawnTerminalGeneration = UINT32_MAX;
+    if (ssh.connected()) {
+        sendSshText(text + "\r");
+    } else {
+        commandLine = text;
+        commandCursor = commandLine.length();
+        executeLocalCommand();
+    }
+    dirty = true;
+}
+
+void runToolbar(size_t i)
+{
+    const bool wasArmed = isArmed(i);
+    disarm();
+    pageNote = "";
+    auto armOrRun = [&](void (*run)()) {
+        if (wasArmed) {
+            run();
+        } else {
+            armedButton = static_cast<int>(i);
+            armedScreen = screen;
+        }
+    };
+    switch (screen) {
+    case Screen::WifiList:
+        if (i == 0) scanWifiNetworks();
+        else if (i == 1) addProfile();
+        else if (i == 2) { saveConfig(); startWifiReconnect(20000); }
+        else if (i == 3) { if (wifiDisabled) enableWifiRuntime(20000); else stopWifiRuntime(); }
+        else if (i == 4) { size_t sel = selectedRow(); if (sel < config.wifi.size()) { activeWifi = sel; beginWifiEdit(sel, false); } }
+        else {
+            const size_t sel = selectedRow();
+            if (sel >= config.wifi.size()) break;
+            if (wasArmed) deleteWifiProfile(sel);
+            else { armedButton = static_cast<int>(i); armedScreen = screen; }
+        }
+        break;
+    case Screen::WifiScan:
+        if (i == 0) scanWifiNetworks();
+        else enterScreen(Screen::WifiList);
+        break;
+    case Screen::SshList:
+        if (i == 0) addProfile();
+        else if (i == 1) { size_t sel = selectedRow(); if (sel < config.ssh.size()) { activeSsh = sel; beginSshEdit(sel, false); } }
+        else if (i == 2) { size_t sel = selectedRow(); if (sel < config.ssh.size()) activeSsh = sel; connectActiveSsh(); }
+        else if (i == 3) {
+            const size_t sel = selectedRow();
+            if (sel >= config.ssh.size()) break;
+            if (wasArmed) deleteSshProfile(sel);
+            else { armedButton = static_cast<int>(i); armedScreen = screen; }
+        }
+        else if (i == 4) enterScreen(Screen::SshKeys);
+        else enterScreen(Screen::SnipList);
+        break;
+    case Screen::SnipList:
+        if (i == 0) runSnippet(selectedRow());
+        else if (i == 1) {
+            config.snippets.push_back(Snippet{String("snippet-") + (config.snippets.size() + 1), ""});
+            beginSnipEdit(config.snippets.size() - 1);
+        } else if (i == 2) {
+            const size_t sel = selectedRow();
+            if (sel < config.snippets.size()) beginSnipEdit(sel);
+        } else {
+            const size_t sel = selectedRow();
+            if (sel >= config.snippets.size()) break;
+            if (wasArmed) {
+                config.snippets.erase(config.snippets.begin() + sel);
+                snippetSelection = 0;
+                saveConfig();
+                focusedContentItem = toolbarCount();
+            } else {
+                armedButton = static_cast<int>(i);
+                armedScreen = screen;
+            }
+        }
+        break;
+    case Screen::BtPage:
+        if (i == 0) {
+            config.keyboard.bleKeyboardEnabled = !config.keyboard.bleKeyboardEnabled;
+            startBlePhase(config.keyboard.bleKeyboardEnabled ? "Turning Bluetooth on..." : "Turning Bluetooth off...");
+            keyboard.configure(config.keyboard);
+            saveConfig();
+            pageNote = config.keyboard.bleKeyboardEnabled ? "Bluetooth is on." : "Bluetooth is off.";
+        } else if (i == 1) btScan();
+        else if (i == 2) btPair();
+        else armOrRun(btForget);
+        break;
+    case Screen::WgPage:
+        if (i == 0) toggleWireGuard();
+        else if (i == 1) toggleRemoteSetup();
+        else if (i == 2) beginWgEdit();
+        else if (i == 3) {
+            startBlePhase("Searching the SD card for WireGuard configs. The screen pauses while it looks...");
+            scanSdFiles(false, true);
+        }
+        else armOrRun([]() {
+            wireguard.stop();
+            config.wireguard = WireGuardConfig{};
+            saveConfig();
+            pageNote = "WireGuard configuration cleared.";
+        });
+        break;
+    case Screen::SshKeys:
+        if (i == 0) generateSshKey();
+        else if (i == 1) toggleRemoteSetup();
+        else if (i == 2) showSelectedPubKey();
+        else if (i == 3) useSelectedKey();
+        else armOrRun(deleteSelectedKey);
+        break;
+    default:
+        break;
+    }
+    dirty = true;
+}
+
+void rowActivate(size_t i)
+{
+    disarm();
+    pageNote = "";
+    switch (screen) {
+    case Screen::WifiList:
+        if (i < config.wifi.size()) {
+            activeWifi = i;
+            appendStatus(String("Active Wi-Fi: ") + config.wifi[i].name);
+            scheduleSave();
+        }
+        break;
+    case Screen::WifiScan:
+        selectScannedWifi(i);
+        break;
+    case Screen::SshList:
+        if (i < config.ssh.size()) {
+            activeSsh = i;
+            appendStatus(String("Active SSH: ") + config.ssh[i].name);
+            scheduleSave();
+        }
+        break;
+    case Screen::SnipList:
+        snippetSelection = i;
+        break;
+    case Screen::BtPage: {
+        const size_t paired = config.keyboard.bleDevices.size();
+        if (i < paired) {
+            config.keyboard.activeBle = i;
+            config.keyboard.bleKeyboardName = config.keyboard.bleDevices[i].name;
+            config.keyboard.bleKeyboardAddress = config.keyboard.bleDevices[i].address;
+            keyboard.configure(config.keyboard);
+            scheduleSave();
+        } else {
+            blePairTarget = i - paired;
+        }
+        break;
+    }
+    case Screen::WgPage:
+        if (i < sdFiles.size()) {
+            File f = SD.open(sdFiles[i].path, "r");
+            if (!f) {
+                pageNote = String("Cannot open ") + sdFiles[i].path;
+            } else {
+                String text = f.readString();
+                f.close();
+                String result;
+                importWireGuardText(text, result);
+                pageNote = result;
+            }
+        }
+        break;
+    case Screen::SshKeys:
+        if (i >= keyNames.size() && i - keyNames.size() < sdFiles.size()) {
+            const String& path = sdFiles[i - keyNames.size()].path;
+            String error;
+            const String name = uniqueKeyName(basenameOnly(path));
+            if (SshKeys::importFromFile(path, name, error)) {
+                pageNote = String("Imported ") + path + " as '" + name + "'. Delete the SD copy if you no longer need it.";
+                refreshKeyNames();
+            } else {
+                pageNote = error;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    dirty = true;
+}
+
+void executeContent(size_t focus)
+{
+    if (screen == Screen::ThemeList) {
+        if (focus < themeCount()) { pendingTheme = focus; dirty = true; }
+        else if (focus < themeUiFocus(0)) pickPendingFont(focus - themeFontFocus(0));
+        else if (focus < themeMinusFocus()) { pendingUi = focus - themeUiFocus(0); dirty = true; }
+        else if (focus == themeMinusFocus()) adjustPendingLine(-2);
+        else if (focus == themePlusFocus()) adjustPendingLine(2);
+        else applyPendingTheme();
+        return;
+    }
+    const size_t tb = toolbarCount();
+    if (focus < tb) {
+        runToolbar(focus);
+    } else {
+        rowActivate(focus - tb);
+    }
+}
+
+bool isContentScreen()
+{
+    switch (screen) {
+    case Screen::WifiList:
+    case Screen::WifiScan:
+    case Screen::SshList:
+    case Screen::SnipList:
+    case Screen::BtPage:
+    case Screen::WgPage:
+    case Screen::SshKeys:
+    case Screen::ThemeList:
+        return true;
+    default:
+        return false;
+    }
+}
+
+size_t contentCount()
+{
+    return screen == Screen::ThemeList ? themeFocusCount() : toolbarCount() + rowCount();
+}
+
 void deleteEditingProfile()
 {
     if (screen == Screen::WifiEdit && editIndex < config.wifi.size()) {
-        config.wifi.erase(config.wifi.begin() + editIndex);
-        if (activeWifi >= config.wifi.size()) {
-            activeWifi = 0;
-        }
-        saveConfig();
         screen = Screen::WifiList;
+        settingScrollOffset = 0;
+        deleteWifiProfile(editIndex);
     } else if (screen == Screen::SshEdit && editIndex < config.ssh.size()) {
-        config.ssh.erase(config.ssh.begin() + editIndex);
-        if (activeSsh >= config.ssh.size()) {
-            activeSsh = 0;
-        }
-        saveConfig();
         screen = Screen::SshList;
+        settingScrollOffset = 0;
+        deleteSshProfile(editIndex);
     }
     dirty = true;
 }
@@ -4579,47 +6327,196 @@ void deleteEditingProfile()
 void saveEditingProfile()
 {
     (void)editIsNew;
+    if (dropdownOpen) {
+        closeDropdown();
+    }
     if (saveConfig()) {
         if (screen == Screen::WifiEdit) {
             screen = Screen::WifiList;
         } else if (screen == Screen::SshEdit) {
             screen = Screen::SshList;
+        } else if (screen == Screen::SnipEdit) {
+            screen = Screen::SnipList;
+        } else if (screen == Screen::WgEdit) {
+            wireguard.stop();
+            screen = Screen::WgPage;
+            String error;
+            pageNote = WireGuardRuntime::validate(config.wireguard, error) ? String("WireGuard settings saved.")
+                                                                           : String("Saved, but incomplete: ") + error;
         } else if (screen == Screen::ConfigEdit) {
             startTimeSync(true);
             keyboard.configure(config.keyboard);
             screen = Screen::Terminal;
+            vt.markAllDirty();
         }
     }
     dirty = true;
 }
 
+String runExtraCommand(const String& command)
+{
+    String c = command;
+    c.trim();
+    String lower = c;
+    lower.toLowerCase();
+    auto arg = [&](size_t prefixLen) {
+        String a = c.length() > prefixLen ? c.substring(prefixLen) : String("");
+        a.trim();
+        return a;
+    };
+    if (lower.startsWith("wg import")) {
+        const String path = arg(9);
+        if (!path.length()) return "ERR usage: wg import <sd-path>";
+        if (!ensureSdReady()) return String("ERR ") + sdLastError;
+        File f = SD.open(normalizeSdPath(path), "r");
+        if (!f || f.isDirectory()) return "ERR cannot open file";
+        String text = f.readString();
+        f.close();
+        String result;
+        return importWireGuardText(text, result) ? result : String("ERR ") + result;
+    }
+    if (lower == "wg remote" || lower == "wg remote stop") {
+        if (lower.endsWith("stop")) {
+            remoteSetup.stop();
+            return "remote setup stopped";
+        }
+        String error;
+        if (!remoteSetup.start(error)) return String("ERR ") + error;
+        return String("open ") + remoteSetup.url() + " PIN " + remoteSetup.pin();
+    }
+    if (lower == "theme" || lower == "theme list") {
+        String out;
+        for (size_t i = 0; i < themeCount(); ++i) {
+            out += String(themeCurrent().id == themeAt(i).id ? "* " : "  ") + themeAt(i).id + "  " + themeAt(i).name + "\n";
+        }
+        return out;
+    }
+    if (lower.startsWith("theme ")) {
+        const int idx = themeIndexById(arg(6));
+        if (idx < 0) return "ERR unknown theme; try: theme list";
+        applyThemeIndex(static_cast<size_t>(idx));
+        return String("theme: ") + themeAt(idx).name;
+    }
+    if (lower == "sshhost" || lower == "sshhost list") {
+        String list = SshClient::knownHostsList();
+        return list.length() ? list : String("no known hosts");
+    }
+    if (lower.startsWith("sshhost forget ")) {
+        return SshClient::forgetHost(arg(15)) ? String("forgotten") : String("ERR no such host");
+    }
+    if (lower == "snip" || lower == "snip list") {
+        if (config.snippets.empty()) return "no snippets; try: snip add <name> <command>";
+        String out;
+        for (size_t i = 0; i < config.snippets.size(); ++i) {
+            out += String(i) + ": " + config.snippets[i].name + " | " + config.snippets[i].text + "\n";
+        }
+        return out;
+    }
+    if (lower.startsWith("snip add ")) {
+        String rest = arg(9);
+        const int sp = rest.indexOf(' ');
+        if (sp <= 0) return "ERR usage: snip add <name> <command>";
+        config.snippets.push_back(Snippet{rest.substring(0, sp), rest.substring(sp + 1)});
+        saveConfig();
+        return "snippet saved";
+    }
+    if (lower.startsWith("snip rm ")) {
+        const size_t idx = static_cast<size_t>(arg(8).toInt());
+        if (idx >= config.snippets.size()) return "ERR no such snippet";
+        config.snippets.erase(config.snippets.begin() + idx);
+        saveConfig();
+        return "snippet removed";
+    }
+    if (lower.startsWith("snip run ")) {
+        const size_t idx = static_cast<size_t>(arg(9).toInt());
+        if (idx >= config.snippets.size()) return "ERR no such snippet";
+        if (!ssh.connected()) return "ERR not connected to SSH";
+        sendSshText(config.snippets[idx].text + "\r");
+        return "sent";
+    }
+    if (lower == "sshkey" || lower == "sshkey list") {
+        refreshKeyNames();
+        if (keyNames.empty()) return "no keys; try: sshkey gen";
+        String out;
+        for (const auto& n : keyNames) out += n + "\n";
+        return out;
+    }
+    if (lower.startsWith("sshkey gen")) {
+        String wanted = arg(10);
+        String name = uniqueKeyName(wanted.length() ? wanted : String("tab5"));
+        String error;
+        if (!SshKeys::generate(name, "", error)) return String("ERR ") + error;
+        String pub = SshKeys::publicLine(name, "", error);
+        return String("created ") + name + "\n" + pub;
+    }
+    if (lower.startsWith("sshkey pub ")) {
+        const String name = arg(11);
+        String error;
+        String pub = SshKeys::publicLine(name, keyPassphraseFor(name), error);
+        return pub.length() ? pub : String("ERR ") + error;
+    }
+    if (lower.startsWith("sshkey rm ")) {
+        const String name = arg(10);
+        if (!SshKeys::remove(name)) return "ERR no such key";
+        for (auto& p : config.ssh) {
+            if (p.keyName == name) { p.keyName = ""; p.keyPassphrase = ""; }
+        }
+        saveConfig();
+        return String("removed ") + name;
+    }
+    if (lower.startsWith("sshkey import ")) {
+        String rest = arg(14);
+        const int sp = rest.indexOf(' ');
+        const String path = sp < 0 ? rest : rest.substring(0, sp);
+        String wanted = sp < 0 ? basenameOnly(path) : rest.substring(sp + 1);
+        wanted.trim();
+        if (!ensureSdReady()) return String("ERR ") + sdLastError;
+        const String name = uniqueKeyName(wanted);
+        String error;
+        return SshKeys::importFromFile(normalizeSdPath(path), name, error) ? String("imported as ") + name
+                                                                           : String("ERR ") + error;
+    }
+    if (lower.startsWith("sshkey use ")) {
+        String rest = arg(11);
+        const int sp = rest.indexOf(' ');
+        const String name = sp < 0 ? rest : rest.substring(0, sp);
+        size_t index = sp < 0 ? activeSsh : static_cast<size_t>(rest.substring(sp + 1).toInt());
+        if (!SshKeys::exists(name)) return "ERR no such key";
+        if (index >= config.ssh.size()) return "ERR no such SSH profile";
+        config.ssh[index].keyName = name;
+        saveConfig();
+        return String("profile ") + config.ssh[index].name + " now uses key " + name;
+    }
+    return "ERR usage: sshkey list|gen [name]|pub <name>|rm <name>|import <sd-path> [name]|use <name> [profile]";
+}
+
 bool handleHeaderTouch(int x, int y)
 {
     keyboardMenuMode = false;
-    if (headerButtonContains(BtnTerminal, x, y)) {
+    if (dropdownOpen) {
+        closeDropdown();
+    }
+    if (headerButtonContains(tabRect(0), x, y)) {
         screen = Screen::Terminal;
+        vt.markAllDirty();
+        lastDrawnTerminalGeneration = UINT32_MAX;
         dirty = true;
-    } else if (headerButtonContains(BtnWifi, x, y)) {
-        screen = Screen::WifiList;
-        settingScrollOffset = 0;
-        focusedContentItem = 0;
-        dirty = true;
-    } else if (headerButtonContains(BtnSsh, x, y)) {
-        screen = Screen::SshList;
-        settingScrollOffset = 0;
-        focusedContentItem = 0;
-        dirty = true;
-    } else if (headerButtonContains(BtnFont, x, y)) {
-        screen = Screen::FontList;
-        settingScrollOffset = 0;
-        focusedContentItem = 0;
-        dirty = true;
-    } else if (headerButtonContains(BtnConfig, x, y)) {
+    } else if (headerButtonContains(tabRect(1), x, y)) {
+        enterScreen(Screen::WifiList);
+    } else if (headerButtonContains(tabRect(2), x, y)) {
+        enterScreen(Screen::BtPage);
+    } else if (headerButtonContains(tabRect(3), x, y)) {
+        enterScreen(Screen::WgPage);
+    } else if (headerButtonContains(tabRect(4), x, y)) {
+        enterScreen(Screen::SshList);
+    } else if (headerButtonContains(tabRect(5), x, y)) {
+        enterScreen(Screen::ThemeList);
+    } else if (headerButtonContains(tabRect(6), x, y)) {
         screen = Screen::ConfigEdit;
         editField = 0;
         setEditCursorToEnd();
         dirty = true;
-    } else if (screen == Screen::Terminal && headerButtonContains(BtnConnect, x, y)) {
+    } else if (screen == Screen::Terminal && headerButtonContains(ctxBtn(0), x, y)) {
         if (ssh.connected()) {
             ssh.disconnect();
             resetCommandEditor();
@@ -4628,15 +6525,14 @@ bool handleHeaderTouch(int x, int y)
         } else {
             connectActiveSsh();
         }
-    } else if (screen == Screen::WifiEdit && headerButtonContains(BtnConnect, x, y)) {
+    } else if (screen == Screen::WifiEdit && headerButtonContains(ctxBtn(0), x, y)) {
         if (saveConfig()) {
             startWifiReconnect(20000);
         }
         dirty = true;
-    } else if ((screen == Screen::WifiEdit || screen == Screen::SshEdit || screen == Screen::ConfigEdit) &&
-               headerButtonContains(BtnSave, x, y)) {
+    } else if (isEditScreen() && headerButtonContains(ctxBtn(1), x, y)) {
         saveEditingProfile();
-    } else if ((screen == Screen::WifiEdit || screen == Screen::SshEdit) && headerButtonContains(BtnDelete, x, y)) {
+    } else if ((screen == Screen::WifiEdit || screen == Screen::SshEdit) && headerButtonContains(ctxBtn(2), x, y)) {
         deleteEditingProfile();
     } else {
         return false;
@@ -4731,180 +6627,106 @@ bool handleKeyboardMenuAction(const KeyAction& action)
     return true;
 }
 
-void handleListTouch(int x, int y)
+void handleContentTouch(int x, int y)
 {
-    if (screen == Screen::WifiList && y < settingListTop()) {
-        if (BodyBtn1.contains(x, y)) {
-            focusedContentItem = 0;
-            scanWifiNetworks();
-        } else if (BodyBtn2.contains(x, y)) {
-            focusedContentItem = 1;
-            addProfile();
-        } else if (BodyBtn3.contains(x, y)) {
-            focusedContentItem = 2;
-            saveConfig();
-            startWifiReconnect(20000);
-        } else if (BodyBtn4.contains(x, y)) {
-            focusedContentItem = 3;
-            if (wifiDisabled) {
-                enableWifiRuntime(20000);
-            } else {
-                stopWifiRuntime();
+    if (screen == Screen::ThemeList) {
+        for (size_t i = 0; i < themeCount(); ++i) {
+            if (themeRowRect(i).contains(x, y)) {
+                focusedContentItem = i;
+                pendingTheme = i;
+                dirty = true;
+                return;
             }
-            dirty = true;
         }
-        return;
-    }
-
-    if (screen == Screen::WifiScan && y < settingListTop()) {
-        if (BodyBtn1.contains(x, y)) {
-            focusedContentItem = 0;
-            scanWifiNetworks();
-        } else if (BodyBtn2.contains(x, y)) {
-            focusedContentItem = 1;
-            screen = Screen::WifiList;
-            settingScrollOffset = 0;
-            dirty = true;
-        }
-        return;
-    }
-
-    if (screen == Screen::SshList && y < settingListTop()) {
-        if (BodyBtn1.contains(x, y)) {
-            focusedContentItem = 0;
-            addProfile();
-        } else if (BodyBtn2.contains(x, y)) {
-            focusedContentItem = 1;
-            if (activeSsh < config.ssh.size()) {
-                beginSshEdit(activeSsh, false);
+        for (size_t i = 0; i < kThemeFontCount; ++i) {
+            if (themeFontBtnRect(i).contains(x, y)) {
+                focusedContentItem = themeFontFocus(i);
+                pickPendingFont(i);
+                return;
             }
-        } else if (BodyBtn3.contains(x, y)) {
-            focusedContentItem = 2;
-            connectActiveSsh();
         }
-        return;
-    }
-
-    if (screen == Screen::FontList) {
-        if (y < settingListTop()) {
-            if (FontMinusBtn.contains(x, y)) {
-                focusedContentItem = 0;
-                adjustTerminalLineStep(-1);
-            } else if (FontPlusBtn.contains(x, y)) {
-                focusedContentItem = 1;
-                adjustTerminalLineStep(1);
-            } else if (FontSaveBtn.contains(x, y)) {
-                focusedContentItem = 2;
-                configureTerminal();
-                saveConfig();
+        for (size_t i = 0; i < kUiSizeCount; ++i) {
+            if (themeUiBtnRect(i).contains(x, y)) {
+                focusedContentItem = themeUiFocus(i);
+                pendingUi = i;
+                dirty = true;
+                return;
             }
-            return;
         }
-        constexpr size_t fontCount = sizeof(TerminalFonts) / sizeof(TerminalFonts[0]);
-        const int rowH = settingRowH();
-        size_t index = static_cast<size_t>((y - settingListTop()) / rowH);
-        if (index < fontCount) {
-            focusedContentItem = index + 3;
-            config.keyboard.terminalFont = TerminalFonts[index].id;
-            config.keyboard.terminalLineStep =
-                max<uint8_t>(TerminalFonts[index].defaultLineStep, max(terminalFontHeight(false), terminalFontHeight(true)));
-            configureTerminal();
-            saveConfig();
-            dirty = true;
+        if (themeApplyRect().contains(x, y)) {
+            focusedContentItem = themeApplyFocus();
+            applyPendingTheme();
+        } else if (themeLineMinusRect().contains(x, y)) {
+            focusedContentItem = themeMinusFocus();
+            adjustPendingLine(-2);
+        } else if (themeLinePlusRect().contains(x, y)) {
+            focusedContentItem = themePlusFocus();
+            adjustPendingLine(2);
         }
         return;
     }
 
+    const size_t tb = toolbarCount();
+    if (y < settingListTop()) {
+        for (size_t i = 0; i < tb; ++i) {
+            if (bodyBtn(static_cast<int>(i)).contains(x, y)) {
+                focusedContentItem = i;
+                runToolbar(i);
+                return;
+            }
+        }
+        return;
+    }
+    const size_t index = settingScrollOffset + static_cast<size_t>((y - settingListTop()) / settingRowH());
+    if (index < rowCount()) {
+        focusedContentItem = index + tb;
+        rowActivate(index);
+    }
+}
+
+void handleEditTouch(int x, int y)
+{
+    const int rowH = settingRowH();
+    if (dropdownOpen) {
+        const Rect r = dropdownRect();
+        if (r.contains(x, y)) {
+            const size_t k = static_cast<size_t>((y - r.y - 2) / rowH);
+            const size_t idx = dropdownTop + k;
+            if (k < kDropdownRows && idx < dropdownOptions.size()) {
+                dropdownPick(idx);
+                return;
+            }
+        }
+        closeDropdown();
+        return;
+    }
     if (y < settingListTop()) {
         return;
     }
-    size_t index = settingScrollOffset + static_cast<size_t>((y - settingListTop()) / settingRowH());
-    if (screen == Screen::WifiList && index < config.wifi.size()) {
-        if (x > M5.Display.width() - 220) {
-            activeWifi = index;
-            appendStatus(String("Active Wi-Fi: ") + config.wifi[activeWifi].name);
-            saveConfig();
-        } else {
-            focusedContentItem = index + 4;
-            activeWifi = index;
-            appendStatus(String("Active Wi-Fi: ") + config.wifi[activeWifi].name);
-            saveConfig();
-            dirty = true;
-        }
-    } else if (screen == Screen::WifiScan && index < scannedNetworks.size()) {
-        focusedContentItem = index + 2;
-        selectScannedWifi(index);
-    } else if (screen == Screen::SshList && index < config.ssh.size()) {
-        if (x > M5.Display.width() - 220) {
-            activeSsh = index;
-            appendStatus(String("Active SSH: ") + config.ssh[activeSsh].name);
-            saveConfig();
-        } else {
-            focusedContentItem = index + 3;
-            activeSsh = index;
-            appendStatus(String("Active SSH: ") + config.ssh[activeSsh].name);
-            saveConfig();
-            dirty = true;
-        }
-    }
-}
-
-void editFocusedSshProfile()
-{
-    if (focusedContentItem >= 3) {
-        size_t index = focusedContentItem - 3;
-        if (index < config.ssh.size()) {
-            beginSshEdit(index, false);
-            return;
-        }
-    }
-    if (activeSsh < config.ssh.size()) {
-        beginSshEdit(activeSsh, false);
-    }
-}
-
-void selectFocusedWifiProfile()
-{
-    if (focusedContentItem < 4) {
-        return;
-    }
-    size_t index = focusedContentItem - 4;
-    if (index < config.wifi.size()) {
-        activeWifi = index;
-        appendStatus(String("Active Wi-Fi: ") + config.wifi[activeWifi].name);
-        saveConfig();
-        dirty = true;
-    }
-}
-
-void selectFocusedSshProfile()
-{
-    if (focusedContentItem < 3) {
-        return;
-    }
-    size_t index = focusedContentItem - 3;
-    if (index < config.ssh.size()) {
-        activeSsh = index;
-        appendStatus(String("Active SSH: ") + config.ssh[activeSsh].name);
-        saveConfig();
-        dirty = true;
-    }
-}
-
-void handleEditTouch(int, int y)
-{
-    if (y < settingListTop()) {
-        return;
-    }
-    uint8_t field = static_cast<uint8_t>((y - settingListTop()) / settingRowH());
+    uint8_t field = static_cast<uint8_t>((y - settingListTop()) / rowH);
     uint8_t maxField = editFieldCount();
     if (field < maxField) {
         editField = field;
         setEditCursorToEnd();
-        if (isChoiceEditField()) {
-            toggleChoiceEditField();
+        const FieldSpec* spec = fieldSpecAt(field);
+        if (spec && spec->choices != Choices::None &&
+            (spec->strict || dropdownArrowRect(settingListTop() + field * rowH).contains(x, y))) {
+            openDropdown();
         }
         dirty = true;
+    }
+}
+
+void handleTap(int x, int y)
+{
+    lastInputMs = millis();
+    const int activeHeaderTouchH = screen == Screen::Terminal ? HeaderTouchH : HeaderH + 20;
+    if ((y < activeHeaderTouchH || (navW && x < navW)) && handleHeaderTouch(x, y)) {
+        return;
+    } else if (isContentScreen()) {
+        handleContentTouch(x, y);
+    } else if (isEditScreen()) {
+        handleEditTouch(x, y);
     }
 }
 
@@ -4973,29 +6795,45 @@ void handleTouch()
         return;
     }
 
-    int x = touch.x;
-    int y = touch.y;
-    const int activeHeaderTouchH = screen == Screen::Terminal ? HeaderTouchH : HeaderH + 20;
-    if (y < activeHeaderTouchH && handleHeaderTouch(x, y)) {
+    handleTap(touch.x, touch.y);
+}
+
+void cycleChoiceField(int dir)
+{
+    const FieldSpec* spec = fieldSpecAt(editField);
+    if (!spec || spec->choices == Choices::None) {
         return;
-    } else if (screen == Screen::WifiList || screen == Screen::WifiScan || screen == Screen::SshList ||
-               screen == Screen::FontList) {
-        handleListTouch(x, y);
-    } else if (screen == Screen::WifiEdit || screen == Screen::SshEdit || screen == Screen::ConfigEdit) {
-        handleEditTouch(x, y);
     }
+    buildChoiceOptions(*spec);
+    std::vector<ChoiceOption> options;
+    for (const auto& o : dropdownOptions) {
+        if (!o.custom) options.push_back(o);
+    }
+    dropdownOptions.clear();
+    if (options.empty()) {
+        return;
+    }
+    const String current = currentEditFieldValue();
+    int idx = 0;
+    for (size_t i = 0; i < options.size(); ++i) {
+        if (options[i].value == current) idx = static_cast<int>(i);
+    }
+    idx = (idx + dir + static_cast<int>(options.size())) % static_cast<int>(options.size());
+    dropdownOptions = options;
+    dropdownPick(static_cast<size_t>(idx));
 }
 
 void editAppendChar(char c)
 {
-    if (screen != Screen::WifiEdit && screen != Screen::SshEdit && screen != Screen::ConfigEdit) {
+    if (!isEditScreen()) {
         return;
     }
 
     const uint8_t maxField = editFieldCount();
+    const FieldSpec* spec = fieldSpecAt(editField);
     if (c == '\r' || c == '\n') {
-        if (isChoiceEditField()) {
-            toggleChoiceEditField();
+        if (spec && spec->choices != Choices::None) {
+            openDropdown();
             return;
         }
         saveEditingProfile();
@@ -5007,9 +6845,11 @@ void editAppendChar(char c)
         dirty = true;
         return;
     }
-    if (isChoiceEditField()) {
-        if (c == ' ' || c == '+' || c == '-') {
-            toggleChoiceEditField();
+    if (spec && spec->strict) {
+        if (c == ' ' || c == '+') {
+            cycleChoiceField(1);
+        } else if (c == '-') {
+            cycleChoiceField(-1);
         }
         return;
     }
@@ -5026,7 +6866,7 @@ void editAppendChar(char c)
             editCursor = pos;
         }
     } else if (std::isprint(static_cast<unsigned char>(c))) {
-        bool numeric = (screen == Screen::SshEdit && editField == 2) || (screen == Screen::ConfigEdit && editField == 2);
+        bool numeric = spec && spec->numeric;
         bool allowed = !numeric || std::isdigit(static_cast<unsigned char>(c)) ||
                        (screen == Screen::ConfigEdit && editField == 2 && c == '-' && editCursor == 0);
         if (allowed) {
@@ -5041,7 +6881,7 @@ void editAppendChar(char c)
 
 void moveEditField(int delta)
 {
-    if (screen != Screen::WifiEdit && screen != Screen::SshEdit && screen != Screen::ConfigEdit) {
+    if (!isEditScreen()) {
         return;
     }
     const uint8_t maxField = editFieldCount();
@@ -5056,26 +6896,9 @@ void moveEditField(int delta)
     dirty = true;
 }
 
-size_t wifiContentCount()
+void clampContentFocus()
 {
-    if (screen == Screen::WifiList) {
-        return 4 + config.wifi.size();
-    }
-    if (screen == Screen::WifiScan) {
-        return 2 + scannedNetworks.size();
-    }
-    if (screen == Screen::SshList) {
-        return 3 + config.ssh.size();
-    }
-    if (screen == Screen::FontList) {
-        return 3 + (sizeof(TerminalFonts) / sizeof(TerminalFonts[0]));
-    }
-    return 0;
-}
-
-void clampWifiContentFocus()
-{
-    size_t count = wifiContentCount();
+    size_t count = contentCount();
     if (!count) {
         focusedContentItem = 0;
         return;
@@ -5085,9 +6908,12 @@ void clampWifiContentFocus()
     }
 }
 
-void ensureWifiFocusedRowVisible()
+void ensureFocusedRowVisible()
 {
-    size_t firstRowFocus = screen == Screen::WifiList ? 4 : (screen == Screen::WifiScan ? 2 : 3);
+    if (screen == Screen::ThemeList) {
+        return;
+    }
+    const size_t firstRowFocus = toolbarCount();
     if (focusedContentItem < firstRowFocus) {
         return;
     }
@@ -5100,12 +6926,13 @@ void ensureWifiFocusedRowVisible()
     }
 }
 
-void moveWifiContentFocus(int delta)
+void moveContentFocus(int delta)
 {
-    size_t count = wifiContentCount();
+    size_t count = contentCount();
     if (!count) {
         return;
     }
+    disarm();
     int next = static_cast<int>(focusedContentItem) + delta;
     if (next < 0) {
         next = count - 1;
@@ -5113,102 +6940,34 @@ void moveWifiContentFocus(int delta)
         next = 0;
     }
     focusedContentItem = static_cast<size_t>(next);
-    ensureWifiFocusedRowVisible();
+    ensureFocusedRowVisible();
     dirty = true;
 }
 
-void executeWifiContentFocus()
+bool handleContentAction(const KeyAction& action)
 {
-    clampWifiContentFocus();
-    if (screen == Screen::WifiList) {
-        if (focusedContentItem == 0) {
-            scanWifiNetworks();
-        } else if (focusedContentItem == 1) {
-            addProfile();
-        } else if (focusedContentItem == 2) {
-            saveConfig();
-            startWifiReconnect(20000);
-        } else if (focusedContentItem == 3) {
-            if (wifiDisabled) {
-                enableWifiRuntime(20000);
-            } else {
-                stopWifiRuntime();
-            }
-            dirty = true;
-        } else {
-            selectFocusedWifiProfile();
-        }
-    } else if (screen == Screen::WifiScan) {
-        if (focusedContentItem == 0) {
-            scanWifiNetworks();
-        } else if (focusedContentItem == 1) {
-            screen = Screen::WifiList;
-            focusedContentItem = 0;
-            settingScrollOffset = 0;
-            dirty = true;
-        } else {
-            size_t index = focusedContentItem - 2;
-            if (index < scannedNetworks.size()) {
-                selectScannedWifi(index);
-            }
-        }
-    } else if (screen == Screen::SshList) {
-        if (focusedContentItem == 0) {
-            addProfile();
-        } else if (focusedContentItem == 1) {
-            editFocusedSshProfile();
-        } else if (focusedContentItem == 2) {
-            connectActiveSsh();
-        } else {
-            selectFocusedSshProfile();
-        }
-    } else if (screen == Screen::FontList) {
-        if (focusedContentItem == 0) {
-            adjustTerminalLineStep(-1);
-        } else if (focusedContentItem == 1) {
-            adjustTerminalLineStep(1);
-        } else if (focusedContentItem == 2) {
-            configureTerminal();
-            saveConfig();
-        } else {
-            constexpr size_t fontCount = sizeof(TerminalFonts) / sizeof(TerminalFonts[0]);
-            size_t index = focusedContentItem - 3;
-            if (index < fontCount) {
-                config.keyboard.terminalFont = TerminalFonts[index].id;
-                config.keyboard.terminalLineStep =
-                    max<uint8_t>(TerminalFonts[index].defaultLineStep, max(terminalFontHeight(false), terminalFontHeight(true)));
-                configureTerminal();
-                saveConfig();
-                dirty = true;
-            }
-        }
-    }
-}
-
-bool handleWifiContentAction(const KeyAction& action)
-{
-    if (keyboardMenuMode) {
+    if (keyboardMenuMode || !isContentScreen()) {
         return false;
     }
-    if (screen != Screen::WifiList && screen != Screen::WifiScan && screen != Screen::SshList &&
-        screen != Screen::FontList) {
-        return false;
+    clampContentFocus();
+    if (screen == Screen::ThemeList && action.type == KeyActionType::Text) {
+        if (action.text == "-") { adjustPendingLine(-2); return true; }
+        if (action.text == "+") { adjustPendingLine(2); return true; }
     }
-    clampWifiContentFocus();
     if (isTabKey(action) || isRightKey(action) || isDownKey(action)) {
-        moveWifiContentFocus(1);
+        moveContentFocus(1);
         return true;
     }
     if (isLeftKey(action) || isUpKey(action)) {
-        moveWifiContentFocus(-1);
+        moveContentFocus(-1);
         return true;
     }
     if (isEnterKey(action)) {
-        executeWifiContentFocus();
+        executeContent(focusedContentItem);
         return true;
     }
     if (action.type == KeyActionType::Scroll) {
-        moveWifiContentFocus(action.value > 0 ? -1 : 1);
+        moveContentFocus(action.value > 0 ? -1 : 1);
         return true;
     }
     return false;
@@ -5270,7 +7029,6 @@ void handleTerminalAction(const KeyAction& action)
                 sendSshText(action.text);
                 trackRemoteCommandText(action.text);
                 cursorVisible = true;
-                lastCursorBlink = millis();
                 vt.markCursorDirty();
             } else {
                 handleDisconnectedTerminalText(action);
@@ -5308,6 +7066,13 @@ void handleTerminalAction(const KeyAction& action)
 
 void handleAction(const KeyAction& action)
 {
+    lastInputMs = millis();
+    if (dropdownOpen && (action.type == KeyActionType::Menu ||
+                         (action.type == KeyActionType::Text && action.text == "\x1B"))) {
+        closeDropdown();
+        return;
+    }
+
     if (action.type == KeyActionType::Menu && screen == Screen::Terminal && ssh.connected()) {
         sendSshText(String(static_cast<char>(0x1B)));
         dirty = true;
@@ -5324,90 +7089,134 @@ void handleAction(const KeyAction& action)
         return;
     }
 
-    if (screen == Screen::FontList && action.type == KeyActionType::Text) {
-        if (action.text == "-") {
-            adjustTerminalLineStep(-1);
-            return;
-        }
-        if (action.text == "+") {
-            adjustTerminalLineStep(1);
-            return;
-        }
-    }
-
-    if ((screen == Screen::WifiList || screen == Screen::WifiScan || screen == Screen::SshList ||
-         screen == Screen::FontList) &&
-        action.type != KeyActionType::Menu) {
-        if (handleWifiContentAction(action)) {
-            return;
-        }
-    }
-
-    if (handleWifiContentAction(action)) {
+    if (handleContentAction(action)) {
         return;
     }
 
-    if (screen == Screen::WifiEdit || screen == Screen::SshEdit || screen == Screen::ConfigEdit) {
+    if (isEditScreen()) {
+        if (dropdownOpen) {
+            if (isUpKey(action)) {
+                dropdownMove(-1);
+            } else if (isDownKey(action) || isTabKey(action)) {
+                dropdownMove(1);
+            } else if (action.type == KeyActionType::Scroll) {
+                dropdownMove(action.value > 0 ? -1 : 1);
+            } else if (isEnterKey(action)) {
+                dropdownPick(dropdownSel);
+            } else {
+                closeDropdown();
+            }
+            return;
+        }
         if (isTabKey(action) || isDownKey(action)) {
             moveEditField(1);
         } else if (isUpKey(action)) {
             moveEditField(-1);
         } else if (isLeftKey(action)) {
-            if (isChoiceEditField()) toggleChoiceEditField();
+            if (isChoiceEditField()) cycleChoiceField(-1);
             else moveEditCursor(-1);
         } else if (isRightKey(action)) {
-            if (isChoiceEditField()) toggleChoiceEditField();
+            if (isChoiceEditField()) cycleChoiceField(1);
             else moveEditCursor(1);
         } else if (action.type == KeyActionType::Text) {
             for (size_t i = 0; i < action.text.length(); ++i) {
                 editAppendChar(action.text[i]);
             }
-        } else if (action.type == KeyActionType::Menu) {
-            if (screen == Screen::WifiEdit) screen = Screen::WifiList;
-            else if (screen == Screen::SshEdit) screen = Screen::SshList;
-            else screen = Screen::Terminal;
-            dirty = true;
         }
         return;
     }
 
     if (screen == Screen::Terminal) {
         handleTerminalAction(action);
-    } else if (action.type == KeyActionType::Text && (isUpKey(action) || isLeftKey(action))) {
-        if (screen == Screen::WifiList) {
-            scrollSettingList(-1, config.wifi.size());
-        } else if (screen == Screen::WifiScan) {
-            scrollSettingList(-1, scannedNetworks.size());
-        } else if (screen == Screen::SshList) {
-            scrollSettingList(-1, config.ssh.size());
+    }
+}
+
+// ---- Session log (SD card, plain text with escape sequences removed) ----
+File sessionLog;
+bool sessionLogOpen = false;
+String sessionLogBuffer;
+uint8_t logEscState = 0; // 0 text, 1 after ESC, 2 in CSI, 3 in OSC
+uint32_t lastLogFlush = 0;
+void flushSessionLog()
+{
+    if (sessionLogOpen && sessionLogBuffer.length()) {
+        sessionLog.print(sessionLogBuffer);
+        sessionLog.flush();
+        sessionLogBuffer = "";
+    }
+    lastLogFlush = millis();
+}
+
+void stopSessionLog()
+{
+    if (sessionLogOpen) {
+        flushSessionLog();
+        sessionLog.close();
+        sessionLogOpen = false;
+        appendStatus("Session log closed");
+    }
+}
+
+void startSessionLog()
+{
+    if (!ensureSdReady()) {
+        return;
+    }
+    SD.mkdir("/logs");
+    String stamp;
+    time_t now = time(nullptr);
+    if (now > 1700000000) {
+        struct tm tmValue;
+        localtime_r(&now, &tmValue);
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tmValue);
+        stamp = buf;
+    } else {
+        stamp = String(millis() / 1000);
+    }
+    String host = currentSshHost;
+    for (size_t i = 0; i < host.length(); ++i) {
+        if (!isalnum(static_cast<unsigned char>(host[i])) && host[i] != '.' && host[i] != '-') host[i] = '_';
+    }
+    const String path = String("/logs/") + host + "-" + stamp + ".log";
+    sessionLog = SD.open(path, "w");
+    sessionLogOpen = static_cast<bool>(sessionLog);
+    logEscState = 0;
+    sessionLogBuffer = "";
+    appendStatus(sessionLogOpen ? String("Logging session to ") + path : String("Cannot open session log"));
+}
+
+void logSessionBytes(const char* data, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        const uint8_t c = static_cast<uint8_t>(data[i]);
+        if (logEscState == 1) {
+            logEscState = c == '[' ? 2 : (c == ']' ? 3 : 0);
+        } else if (logEscState == 2) {
+            if (c >= 0x40 && c <= 0x7E) logEscState = 0;
+        } else if (logEscState == 3) {
+            if (c == 0x07) logEscState = 0;
+            else if (c == 0x1B) logEscState = 1;
+        } else if (c == 0x1B) {
+            logEscState = 1;
+        } else if (c == '\n' || c == '\t' || c >= 0x20) {
+            sessionLogBuffer += static_cast<char>(c);
         }
-    } else if (action.type == KeyActionType::Text && (isDownKey(action) || isRightKey(action) || isTabKey(action))) {
-        if (screen == Screen::WifiList) {
-            scrollSettingList(1, config.wifi.size());
-        } else if (screen == Screen::WifiScan) {
-            scrollSettingList(1, scannedNetworks.size());
-        } else if (screen == Screen::SshList) {
-            scrollSettingList(1, config.ssh.size());
-        }
-    } else if (action.type == KeyActionType::Scroll) {
-        if (screen == Screen::WifiList) {
-            scrollSettingList(action.value, config.wifi.size());
-        } else if (screen == Screen::WifiScan) {
-            scrollSettingList(action.value, scannedNetworks.size());
-        } else if (screen == Screen::SshList) {
-            scrollSettingList(action.value, config.ssh.size());
-        }
-    } else if (action.type == KeyActionType::Menu) {
-        screen = screen == Screen::WifiScan ? Screen::WifiList : Screen::Terminal;
-        settingScrollOffset = 0;
-        dirty = true;
+    }
+    if (sessionLogBuffer.length() > 2048 || millis() - lastLogFlush > 3000) {
+        flushSessionLog();
     }
 }
 
 void pollSsh()
 {
     if (!ssh.connected()) {
+        stopSessionLog();
         return;
+    }
+    ssh.keepAlive();
+    if (config.system.logSessions && !sessionLogOpen) {
+        startSessionLog();
     }
     char buffer[512];
     bool received = false;
@@ -5418,6 +7227,9 @@ void pollSsh()
         if (n > 0) {
             setCrashStage("ssh.append");
             vt.write(buffer, static_cast<size_t>(n));
+            if (sessionLogOpen) {
+                logSessionBytes(buffer, n);
+            }
             received = true;
             lastSshReceive = millis();
             continue;
@@ -5444,6 +7256,8 @@ void serialPrintHelp()
     Serial.println("Tab5 SSH serial API");
     Serial.println("  help");
     Serial.println("  status");
+    Serial.println("  perf");
+    Serial.println("  ui tap <x> <y> | ui type <text> | ui shot");
     Serial.println("  crash");
     Serial.println("  sd status");
     Serial.println("  sd df");
@@ -5457,6 +7271,11 @@ void serialPrintHelp()
     Serial.println("  wifi status");
     Serial.println("  wifi off");
     Serial.println("  wifi on");
+    Serial.println("  wg status|on|off|reset|set <address|private-key|endpoint|port|public-key> <value>");
+    Serial.println("  wg import <sd-path> | wg remote [stop]");
+    Serial.println("  sshkey list|gen [name]|pub <name>|rm <name>|import <sd-path> [name]|use <name> [profile]");
+    Serial.println("  theme [list|<id>]");
+    Serial.println("  sshhost [list|forget <host[:port]>] | snip [list|add <name> <cmd>|run <n>|rm <n>]");
     Serial.println("  ssh list");
     Serial.println("  ssh active <index>");
     Serial.println("  ssh connect [index]");
@@ -6068,12 +7887,63 @@ void handleSerialCommand(String command)
         return;
     }
     Serial.print("> ");
-    Serial.println(command);
+    String echoCommand = command;
+    echoCommand.toLowerCase();
+    if (echoCommand.startsWith("wg set private-key ")) Serial.println("wg set private-key [redacted]");
+    else Serial.println(command);
 
     if (command == "help" || command == "?") {
         serialPrintHelp();
     } else if (command == "status") {
         serialPrintStatus();
+    } else if (command == "perf") {
+        serialPrintPerf();
+    } else if (command == "ui shot") {
+        // Stream the current frame as 24-bit RGB so a host can reconstruct a screenshot.
+        draw();
+        const int w = screenSprite.width();
+        const int h = screenSprite.height();
+        Serial.setTxTimeoutMs(2000); // the frame must arrive intact; normal output stays non-blocking
+        Serial.printf("SHOT %d %d\n", w, h);
+        static uint8_t row[1280 * 3];
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w && x < 1280; ++x) {
+                const auto px = screenSprite.readPixelRGB(x, y);
+                row[x * 3] = px.R8();
+                row[x * 3 + 1] = px.G8();
+                row[x * 3 + 2] = px.B8();
+            }
+            Serial.write(row, static_cast<size_t>(min(w, 1280)) * 3);
+        }
+        Serial.println("\nSHOT_END");
+        Serial.setTxTimeoutMs(0);
+    } else if (command.startsWith("ui tap ")) {
+        int x = -1, y = -1;
+        if (sscanf(command.c_str() + 7, "%d %d", &x, &y) != 2 || x < 0 || y < 0 ||
+            x >= M5.Display.width() || y >= M5.Display.height()) {
+            Serial.println("ERR ui tap coordinates");
+        } else {
+            const uint32_t start = micros();
+            handleTap(x, y);
+            if (dirty) draw();
+            Serial.printf("ui tap screen=%u elapsed=%luus build=%luus push=%luus\r\n",
+                          static_cast<unsigned>(screen), static_cast<unsigned long>(micros() - start),
+                          static_cast<unsigned long>(lastDrawBuildUs), static_cast<unsigned long>(lastDrawPushUs));
+        }
+    } else if (command.startsWith("ui type ")) {
+        const String input = command.substring(8);
+        uint32_t maxKeyUs = 0;
+        const uint32_t start = micros();
+        for (size_t i = 0; i < input.length(); ++i) {
+            const uint32_t keyStart = micros();
+            handleAction({KeyActionType::Text, String(input[i]), 0});
+            if (dirty) draw();
+            maxKeyUs = max(maxKeyUs, micros() - keyStart);
+        }
+        Serial.printf("ui type chars=%u elapsed=%luus maxKey=%luus build=%luus push=%luus\r\n",
+                      static_cast<unsigned>(input.length()), static_cast<unsigned long>(micros() - start),
+                      static_cast<unsigned long>(maxKeyUs), static_cast<unsigned long>(lastDrawBuildUs),
+                      static_cast<unsigned long>(lastDrawPushUs));
     } else if (command == "crash") {
         Serial.printf("resetStageMagic=0x%08x stage=%s\r\n", static_cast<unsigned>(crashStageMagic), crashStage);
     } else if (command == "sd status") {
@@ -6106,6 +7976,11 @@ void handleSerialCommand(String command)
     } else if (command == "wifi on") {
         enableWifiRuntime(20000);
         Serial.println("OK wifi on");
+    } else if (command == "wg" || command.startsWith("wg ")) {
+        Serial.println(runWireGuardCommand(command));
+    } else if (command == "sshkey" || command.startsWith("sshkey ") || command == "theme" || command.startsWith("theme ") ||
+               command == "sshhost" || command.startsWith("sshhost ") || command == "snip" || command.startsWith("snip ")) {
+        Serial.println(runExtraCommand(command));
     } else if (command == "ssh list") {
         serialPrintSshProfiles();
     } else if (command == "term dump") {
@@ -6184,11 +8059,17 @@ void pollSerialApi()
 void initScreenSprite()
 {
     screenSprite.setPsram(true);
-    screenSprite.setColorDepth(8);
-    screenSpriteReady = screenSprite.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
+    // The Tab5 DSI framebuffer is RGB565. Match it so full-screen tab changes
+    // can use a direct pixel copy instead of converting every 8-bit pixel.
+    screenSprite.setColorDepth(lgfx::color_depth_t::rgb565_nonswapped);
+    screenSpriteReady = screenSprite.createSprite(M5.Display.height(), M5.Display.width()) != nullptr;
+    if (!screenSpriteReady) {
+        screenSprite.setColorDepth(8);
+        screenSpriteReady = screenSprite.createSprite(M5.Display.height(), M5.Display.width()) != nullptr;
+    }
     if (!screenSpriteReady) {
         screenSprite.setColorDepth(4);
-        screenSpriteReady = screenSprite.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
+        screenSpriteReady = screenSprite.createSprite(M5.Display.height(), M5.Display.width()) != nullptr;
     }
     if (!screenSpriteReady) {
         M5.Display.fillScreen(TFT_BLACK);
@@ -6198,6 +8079,7 @@ void initScreenSprite()
             delay(1000);
         }
     }
+    screenSprite.setRotation(3);
 }
 
 }
@@ -6226,9 +8108,13 @@ void setup()
     M5.begin(cfg);
     M5.Display.setRotation(3);
     M5.Display.setBrightness(100);
+    themeApply(config.ui.theme);
     initScreenSprite();
     configureTerminal();
 
+    // With USB CDC, a blocking write waits for the host to read. When no serial monitor is
+    // attached every status line would stall the UI, so drop output instead of waiting.
+    Serial.setTxTimeoutMs(0);
     Serial.begin(115200);
     WiFi.onEvent(handleWifiEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     terminal.append("Tab5 CLI\n");
@@ -6245,11 +8131,56 @@ void setup()
         appendStatus(String("[boot] ") + settings.lastError());
     } else {
         migrateLegacyLineStep();
+        themeApply(config.ui.theme);
+        applyNav();
+        configureTerminal();
         activeWifi = config.activeWifi;
         activeSsh = config.activeSsh;
         appendStatus(String("[boot] profiles loaded: Wi-Fi ") + config.wifi.size() + ", SSH " + config.ssh.size());
     }
 
+    remoteSetup.onWireGuard = [](const String& conf, String& result) {
+        const bool ok = importWireGuardText(conf, result);
+        pageNote = result;
+        if (ok && ensureSdReady()) {
+            SD.mkdir("/wg");
+            File copy = SD.open(String("/wg/") + sanitizeKeyName(config.wireguard.endpoint) + ".conf", "w");
+            if (copy) {
+                copy.print(conf);
+                copy.close();
+                result += "; copy saved in /wg on the SD card";
+                pageNote = result;
+            }
+        }
+        return ok;
+    };
+    remoteSetup.onSshKey = [](const String& name, const String& pem, String& result) {
+        String wanted = name;
+        wanted.trim();
+        if (wanted.length() && SshKeys::exists(sanitizeKeyName(wanted))) {
+            result = "a key with that name already exists; choose another name or delete it on the device";
+            return false;
+        }
+        const String finalName = uniqueKeyName(wanted.length() ? wanted : String("uploaded"));
+        if (!SshKeys::save(finalName, pem, result)) {
+            return false;
+        }
+        refreshKeyNames();
+        result = String("saved SSH key '") + finalName + "'";
+        pageNote = result;
+        return true;
+    };
+    remoteSetup.onPublicKeys = []() {
+        refreshKeyNames();
+        String out;
+        for (const auto& name : keyNames) {
+            String error;
+            String line = SshKeys::publicLine(name, keyPassphraseFor(name), error);
+            out += line.length() ? line : String("# ") + name + ": " + error;
+            out += "\n";
+        }
+        return out;
+    };
     keyboard.configure(config.keyboard);
     keyboard.begin();
     appendStatus(String("[boot] ") + keyboard.status());
@@ -6268,31 +8199,39 @@ void setup()
 
 void loop()
 {
+    uint32_t phaseStart = micros();
     M5.update();
+    perfAdd(PerfM5, phaseStart);
+    phaseStart = micros();
     pollSerialApi();
+    perfAdd(PerfSerial, phaseStart);
+    phaseStart = micros();
     handleTouch();
+    perfAdd(PerfTouch, phaseStart);
+    phaseStart = micros();
     keyboard.update();
     while (keyboard.available()) {
         handleAction(keyboard.read());
     }
+    perfAdd(PerfKeyboard, phaseStart);
+    phaseStart = micros();
     pollWifi();
     pollWifiScan();
     pollTimeSync();
-    pollSsh();
-
-    if ((screen == Screen::Terminal || screen == Screen::WifiEdit || screen == Screen::SshEdit ||
-         screen == Screen::ConfigEdit) &&
-        millis() - lastCursorBlink >= 500) {
-        lastCursorBlink = millis();
-        if (ssh.connected()) {
-            vt.markCursorDirty();
-        }
-        cursorVisible = !cursorVisible;
-        if (ssh.connected()) {
-            vt.markCursorDirty();
-        }
+    perfAdd(PerfWifi, phaseStart);
+    phaseStart = micros();
+    wireguard.poll(config.wireguard);
+    if (saveDueAt && static_cast<int32_t>(millis() - saveDueAt) >= 0 && millis() - lastInputMs > 800) {
+        saveConfig();
+    }
+    remoteSetup.poll();
+    if (remoteSetup.takeChanged()) {
         dirty = true;
     }
+    perfAdd(PerfWireguard, phaseStart);
+    phaseStart = micros();
+    pollSsh();
+    perfAdd(PerfSsh, phaseStart);
 
     uint32_t drawInterval = 5;
     if (ssh.connected() && millis() - lastSshReceive < 25 && millis() - lastDraw < 250) {
@@ -6301,10 +8240,16 @@ void loop()
 
     if (dirty && millis() - lastDraw > drawInterval) {
         lastDraw = millis();
+        phaseStart = micros();
         draw();
+        perfAdd(PerfDraw, phaseStart);
     } else if (headerDirty && millis() - lastDraw > drawInterval) {
         lastDraw = millis();
+        phaseStart = micros();
         drawHeaderOnly();
+        perfAdd(PerfDraw, phaseStart);
     }
+    ++perfLoopCount;
+    perfSnapshot();
     delay(2);
 }
